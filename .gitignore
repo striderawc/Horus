@@ -1,2 +1,28 @@
 # Local dataset (large image files — do not commit)
 /Dataset/
+
+# Processed modalities (events, caches)
+/data/processed/
+*.h5
+
+# External tools
+/third_party/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp

@@ -1,0 +1,69 @@
+# Horus data pipeline configuration
+
+paths:
+  raw_dataset: Dataset
+  processed_root: data/processed
+  events_subdir: events
+
+# Original TrackNet video properties
+source:
+  width: 1280
+  height: 720
+  fps: 30
+
+# Training resolution (coords/heatmaps scaled to this)
+image:
+  width: 640
+  height: 360
+
+sequence:
+  # Number of frames in an RGB/diff/event window (TrackNet-style)
+  length: 3
+  # Label is taken from the last frame in the window
+  label_frame: last
+
+splits:
+  train: [game1, game2, game3, game4, game5, game6, game7]
+  val: [game8, game9]
+  test: [game10]
+
+heatmap:
+  sigma: 2.5
+  # Peak value of the Gaussian (TrackNet uses 1.0)
+  amplitude: 1.0
+
+frame_diff:
+  # absolute | signed
+  mode: absolute
+  # grayscale before differencing
+  grayscale: true
+
+v2e:
+  # CLI binary (must be on PATH after installing SensorsINI/v2e)
+  executable: v2e
+  input_frame_rate: 30
+  disable_slomo: true
+  skip_video_output: true
+  # Downscale for manageable event storage (null = keep source size)
+  output_width: 640
+  output_height: 360
+  # DVS preset: clean | noisy | null
+  dvs_params: clean
+  # Extra args appended to the CLI (list of strings).
+  # Wrapper always adds: --overwrite --unique_output_folder false --no_preview
+  extra_args: []
+
+events:
+  # Event-frame representation: 2 channels (pos, neg) per time window
+  event_frame:
+    channels: polarity  # polarity | count
+  # Voxel grid over each frame interval (and stacked across sequence)
+  voxel:
+    num_bins: 5
+  # Time span of one original frame at source fps
+  frame_dt: 0.0333333333
+
+dataloader:
+  batch_size: 4
+  num_workers: 2
+  shuffle_train: true
