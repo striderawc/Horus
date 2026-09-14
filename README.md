@@ -6,7 +6,7 @@ Neuromorphic tennis ball tracker. The goal is to predict ball position over time
 2. **Frame differencing**
 3. **V2E-simulated event streams** (event frames and voxel grids)
 
-Tracks feed later stages (court geometry → bounce location and ball speed). Models will include a CNN baseline and an SNN; this repo phase focuses on the **dataset pipeline**.
+Tracks feed later stages (court geometry → bounce location and ball speed). Models include a CNN baseline and (later) an SNN.
 
 ## Dataset
 
@@ -115,7 +115,16 @@ Each sample includes:
 - `coords` — `(x, y)` in training resolution
 - `visibility`, `status`, plus clip metadata
 
-Label is taken from the **last** frame of each length-`N` window (`sequence.length` in config, default 3).
+Label is taken from the **last** frame of each length-`N` window (`sequence.length` in config, fixed at **3** for the RGB CNN).
+
+## RGB CNN
+
+2D encoder–decoder (`BallHeatmapCNN`): three RGB frames channel-concatenated to `(9, H, W)` → Gaussian heatmap `(1, H, W)`. Train with MSE against the labeled Gaussian target; best checkpoint by val pixel distance goes to `checkpoints/rgb_cnn.pt`.
+
+```bash
+python scripts/train_rgb.py --epochs 20
+python scripts/train_rgb.py --batch-size 8 --lr 1e-3
+```
 
 ## Scripts
 
@@ -123,6 +132,7 @@ Label is taken from the **last** frame of each length-`N` window (`sequence.leng
 |--------|---------|
 | `scripts/index_dataset.py` | Print clip / split / sample counts |
 | `scripts/smoke_dataloader.py` | Load one batch; print tensor shapes |
+| `scripts/train_rgb.py` | Train RGB heatmap CNN |
 | `scripts/convert_v2e.py` | Run v2e → `events.h5` (`--clip`, `--force`, `--limit`) |
 | `scripts/precompute_events.py` | Bin events → frames + voxels (same flags; skips existing) |
 | `scripts/synthesize_events.py` | Dev-only synthetic `events.h5` without v2e |
@@ -135,6 +145,6 @@ Batch conversion is resume-friendly: existing outputs are skipped unless you pas
 |------|--------|
 | 1 Learn | — |
 | 2 Collect / prepare dataset | **in progress** |
-| 3 Train RGB CNN, Diff CNN, V2E SNN | later |
+| 3 Train RGB CNN, Diff CNN, V2E SNN | RGB CNN ready; Diff / SNN later |
 | 4 Metrics (bounce, speed) | later |
 | 5 App | later |

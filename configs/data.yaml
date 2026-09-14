@@ -67,3 +67,10 @@ dataloader:
   batch_size: 4
   num_workers: 2
   shuffle_train: true
+
+train:
+  epochs: 20
+  lr: 0.001
+  # Weight peak heatmap cells vs background (unweighted MSE favors all-zeros)
+  pos_weight: 100
+  checkpoint_dir: checkpoints
