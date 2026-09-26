@@ -19,14 +19,16 @@ def _block(in_ch: int, out_ch: int) -> nn.Sequential:
 
 
 class BallHeatmapCNN(nn.Module):
-    """TrackNet-lite: 9-channel input (3 RGB frames concat) → 1-channel heatmap."""
+    """TrackNet-lite encoder–decoder → 1-channel Gaussian heatmap.
 
-    IN_CH = 9  # 3 frames × 3 RGB
+    ``in_ch``: 9 RGB, 2 frame-diff, 6 event-frame (3×2 polarity).
+    """
 
-    def __init__(self, base: int = 16) -> None:
+    def __init__(self, in_ch: int = 9, base: int = 16) -> None:
         super().__init__()
+        self.in_ch = in_ch
         b, b2, b4 = base, base * 2, base * 4
-        self.down1 = _block(self.IN_CH, b)
+        self.down1 = _block(in_ch, b)
         self.down2 = _block(b, b2)
         self.down3 = _block(b2, b4)
         self.pool = nn.MaxPool2d(2)
@@ -37,7 +39,7 @@ class BallHeatmapCNN(nn.Module):
         self.head = nn.Conv2d(b, 1, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 9, H, W)
+        # x: (B, in_ch, H, W)
         d1 = self.down1(x)
         d2 = self.down2(self.pool(d1))
         d3 = self.down3(self.pool(d2))

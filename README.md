@@ -6,7 +6,7 @@ Neuromorphic tennis ball tracker. The goal is to predict ball position over time
 2. **Frame differencing**
 3. **V2E-simulated event streams** (event frames and voxel grids)
 
-Tracks feed later stages (court geometry → bounce location and ball speed). Models include a CNN baseline and (later) an SNN.
+Tracks feed later stages (court geometry → bounce location and ball speed). Models include heatmap CNNs and an event-frame SNN.
 
 ## Dataset
 
@@ -115,16 +115,71 @@ Each sample includes:
 - `coords` — `(x, y)` in training resolution
 - `visibility`, `status`, plus clip metadata
 
-Label is taken from the **last** frame of each length-`N` window (`sequence.length` in config, fixed at **3** for the RGB CNN).
+Label is taken from the **last** frame of each length-`N` window (`sequence.length` in config, fixed at **3** for the heatmap models).
 
-## RGB CNN
+## Heatmap CNNs (RGB / frame-diff)
 
-2D encoder–decoder (`BallHeatmapCNN`): three RGB frames channel-concatenated to `(9, H, W)` → Gaussian heatmap `(1, H, W)`. Train with MSE against the labeled Gaussian target; best checkpoint by val pixel distance goes to `checkpoints/rgb_cnn.pt`.
+Same 2D encoder–decoder (`BallHeatmapCNN`); only input channels change:
+
+| Modality | Input | Checkpoint |
+|----------|-------|------------|
+| `rgb` | 3 RGB frames → `(9, H, W)` | `checkpoints/rgb_cnn.pt` |
+| `diff` | 2 grayscale diffs → `(2, H, W)` | `checkpoints/diff_cnn.pt` |
+| `event_frame` | 3 polarity frames → `(6, H, W)` | `checkpoints/event_frame_cnn.pt` |
+
+`event_frame` needs precomputed `data/processed/events/<game>/<clip>/event_frames.h5` (run `convert_v2e` + `precompute_events`). Clips without those files are skipped; train **and** val games need coverage.
+
+Training hyperparams live under `train:` in [`configs/data.yaml`](configs/data.yaml) (`epochs`, `lr`, `batch_size`, `num_workers`, `pos_weight`). CLI flags override them.
 
 ```bash
-python scripts/train_rgb.py --epochs 20
-python scripts/train_rgb.py --batch-size 8 --lr 1e-3
+python scripts/train_cnn.py --modality rgb
+python scripts/train_cnn.py --modality diff
+python scripts/train_cnn.py --modality event_frame
+# shortcuts:
+python scripts/train_rgb.py
+python scripts/train_diff.py
+python scripts/train_event.py
+# override config:
+python scripts/train_diff.py --epochs 20 --batch-size 8 --lr 1e-3
 ```
+
+## Event-frame SNN
+
+`BallHeatmapSNN` uses the same `event_frame` samples as the CNN (`(6, H, W)`). It unrolls them as 3 polarity steps through a small conv-LIF encoder and writes a sigmoid heatmap from the last membrane. Leak, threshold, and width live under `snn:` in [`configs/data.yaml`](configs/data.yaml). Checkpoint: `checkpoints/event_frame_snn.pt`.
+
+```bash
+python scripts/train_snn.py
+```
+
+## Evaluating models
+
+Bench any heatmap model on accuracy (`mean_px`, Acc@5/10), FLOPs, and latency. Same metrics for every architecture so results are comparable.
+
+```bash
+pip install 'horus[eval]'   # fvcore for FLOPs (optional but recommended)
+
+python scripts/eval_models.py \
+  --checkpoint checkpoints/rgb_cnn.pt \
+  --arch rgb_cnn \
+  --split test
+
+python scripts/eval_models.py \
+  --checkpoint checkpoints/diff_cnn.pt \
+  --arch diff_cnn \
+  --split test
+
+python scripts/eval_models.py \
+  --checkpoint checkpoints/event_frame_cnn.pt \
+  --arch event_frame_cnn \
+  --split test
+
+python scripts/eval_models.py \
+  --checkpoint checkpoints/event_frame_snn.pt \
+  --arch event_frame_snn \
+  --split test
+```
+
+Compare multiple models with repeated `--model` specs (`name=...,ckpt=...,arch=...,modality=...`). The table reports best accuracy (lowest `mean_px`) and best efficiency (`acc@5 / GFLOPs`, `acc@5 / latency_ms`). JSON is written under `results/eval/`.
 
 ## Scripts
 
@@ -132,7 +187,12 @@ python scripts/train_rgb.py --batch-size 8 --lr 1e-3
 |--------|---------|
 | `scripts/index_dataset.py` | Print clip / split / sample counts |
 | `scripts/smoke_dataloader.py` | Load one batch; print tensor shapes |
-| `scripts/train_rgb.py` | Train RGB heatmap CNN |
+| `scripts/train_cnn.py` | Train RGB / frame-diff / event-frame heatmap CNN |
+| `scripts/train_rgb.py` | Shortcut → `train_cnn --modality rgb` |
+| `scripts/train_diff.py` | Shortcut → `train_cnn --modality diff` |
+| `scripts/train_event.py` | Shortcut → `train_cnn --modality event_frame` |
+| `scripts/train_snn.py` | Train event-frame heatmap SNN |
+| `scripts/eval_models.py` | Accuracy / FLOPs / latency bench |
 | `scripts/convert_v2e.py` | Run v2e → `events.h5` (`--clip`, `--force`, `--limit`) |
 | `scripts/precompute_events.py` | Bin events → frames + voxels (same flags; skips existing) |
 | `scripts/synthesize_events.py` | Dev-only synthetic `events.h5` without v2e |
@@ -145,6 +205,6 @@ Batch conversion is resume-friendly: existing outputs are skipped unless you pas
 |------|--------|
 | 1 Learn | — |
 | 2 Collect / prepare dataset | **in progress** |
-| 3 Train RGB CNN, Diff CNN, V2E SNN | RGB CNN ready; Diff / SNN later |
+| 3 Train RGB CNN, Diff CNN, V2E SNN | RGB / Diff / event-frame CNN and event-frame SNN ready |
 | 4 Metrics (bounce, speed) | later |
 | 5 App | later |

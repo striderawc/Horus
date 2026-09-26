@@ -68,9 +68,19 @@ dataloader:
   num_workers: 2
   shuffle_train: true
 
+# Event-frame SNN (scripts/train_snn.py). steps = sequence.length.
+# Eval factory in horus.eval.bench hardcodes these defaults (base=16, beta=0.9, threshold=1).
+snn:
+  beta: 0.9
+  threshold: 1.0
+  base: 16
+
+# Hyperparams for scripts/train_cnn.py and scripts/train_snn.py (CLI flags override these)
 train:
   epochs: 20
   lr: 0.001
+  batch_size: 4
+  num_workers: 2
   # Weight peak heatmap cells vs background (unweighted MSE favors all-zeros)
   pos_weight: 100
   checkpoint_dir: checkpoints

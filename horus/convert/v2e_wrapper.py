@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -115,13 +116,19 @@ def run_v2e_on_clip(
         encoding="utf-8",
     )
 
-    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    # Avoid DESKTOP_LAUNCH / xdg-open popups from upstream v2e.
+    run_env = {**os.environ, "DESKTOP_LAUNCH": "true "}
+    result = subprocess.run(
+        cmd, check=False, capture_output=True, text=True, env=run_env
+    )
     if result.returncode != 0:
         # Older forks used --skip_video_files instead of --skip_video_output
         err = (result.stderr or "") + (result.stdout or "")
         if "skip_video_output" in err and "--skip_video_files" not in cmd:
             alt = [a if a != "--skip_video_output" else "--skip_video_files" for a in cmd]
-            result = subprocess.run(alt, check=False, capture_output=True, text=True)
+            result = subprocess.run(
+                alt, check=False, capture_output=True, text=True, env=run_env
+            )
             cmd = alt
         if result.returncode != 0:
             raise RuntimeError(

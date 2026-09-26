@@ -8,6 +8,9 @@
 # Training checkpoints
 /checkpoints/
 
+# Eval bench outputs
+/results/
+
 # External tools
 /third_party/
 

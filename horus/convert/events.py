@@ -218,9 +218,14 @@ def load_event_frame_window(
     """Load ``length`` event frames starting at ``start_idx`` → ``(2*L, H, W)``."""
     with h5py.File(path, "r") as h5:
         data = h5["event_frames"]
+        if start_idx + length > data.shape[0]:
+            raise IndexError(
+                f"{path}: need frames [{start_idx}, {start_idx + length}) "
+                f"but only {data.shape[0]} available (truncated conversion?)"
+            )
         window = np.asarray(data[start_idx : start_idx + length], dtype=np.float32)
-    # (L, 2, H, W) → (2L, H, W)
-    return window.reshape(-1, window.shape[-2], window.shape[-1])
+    # (L, 2, H, W) → (2L, H, W); copy so tensors are writable under DataLoader workers
+    return window.reshape(-1, window.shape[-2], window.shape[-1]).copy()
 
 
 def load_voxel_window(
@@ -231,5 +236,10 @@ def load_voxel_window(
     """Load ``length`` voxels starting at ``start_idx`` → ``(bins*L, H, W)``."""
     with h5py.File(path, "r") as h5:
         data = h5["voxels"]
+        if start_idx + length > data.shape[0]:
+            raise IndexError(
+                f"{path}: need voxels [{start_idx}, {start_idx + length}) "
+                f"but only {data.shape[0]} available (truncated conversion?)"
+            )
         window = np.asarray(data[start_idx : start_idx + length], dtype=np.float32)
-    return window.reshape(-1, window.shape[-2], window.shape[-1])
+    return window.reshape(-1, window.shape[-2], window.shape[-1]).copy()

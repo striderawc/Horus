@@ -1,1 +1,5 @@
-"""Training loops — populated in a later step."""
+"""Training loops."""
+
+from horus.train.heatmap import evaluate, train_one_epoch
+
+__all__ = ["evaluate", "train_one_epoch"]

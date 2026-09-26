@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import h5py
 import torch
 from torch.utils.data import Dataset
 
@@ -59,6 +60,7 @@ class BallTrackDataset(Dataset):
         if modality in ("event_frame", "voxel"):
             ready: list[ClipInfo] = []
             missing: list[str] = []
+            short: list[str] = []
             for clip in clips:
                 d = events_clip_dir(cfg, clip.game, clip.clip)
                 needed = (
@@ -66,15 +68,26 @@ class BallTrackDataset(Dataset):
                     if modality == "event_frame"
                     else d / "voxels.h5"
                 )
-                if needed.is_file():
-                    ready.append(clip)
-                else:
+                if not needed.is_file():
                     missing.append(str(needed))
+                    continue
+                # Reject truncated conversions (e.g. early --stop_time smoke runs)
+                with h5py.File(needed, "r") as h5:
+                    key = "event_frames" if modality == "event_frame" else "voxels"
+                    n_h5 = int(h5[key].shape[0])
+                if n_h5 < clip.num_frames:
+                    short.append(f"{clip.key} (h5={n_h5}, frames={clip.num_frames})")
+                    continue
+                ready.append(clip)
             if not ready:
-                preview = "\n  ".join(missing[:5])
-                more = f"\n  ... and {len(missing) - 5} more" if len(missing) > 5 else ""
+                preview = "\n  ".join((missing + short)[:5])
+                more = (
+                    f"\n  ... and {len(missing) + len(short) - 5} more"
+                    if len(missing) + len(short) > 5
+                    else ""
+                )
                 raise FileNotFoundError(
-                    f"No precomputed event files for modality={modality}. "
+                    f"No usable precomputed event files for modality={modality}. "
                     f"Run scripts/convert_v2e.py then scripts/precompute_events.py.\n"
                     f"  {preview}{more}"
                 )
@@ -82,6 +95,12 @@ class BallTrackDataset(Dataset):
                 print(
                     f"[BallTrackDataset] skipping {len(missing)} clip(s) "
                     f"without {modality} files; using {len(ready)}"
+                )
+            if short:
+                print(
+                    f"[BallTrackDataset] skipping {len(short)} truncated clip(s): "
+                    + ", ".join(short[:3])
+                    + ("…" if len(short) > 3 else "")
                 )
             clips = ready
             self.clips = clips
