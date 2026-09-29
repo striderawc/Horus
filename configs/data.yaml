@@ -69,7 +69,8 @@ dataloader:
   shuffle_train: true
 
 # Event-frame SNN (scripts/train_snn.py). steps = sequence.length.
-# Eval factory in horus.eval.bench hardcodes these defaults (base=16, beta=0.9, threshold=1).
+# Architecture mirrors BallHeatmapCNN (encoder–decoder, same base widths) with LIF
+# instead of ReLU; one polarity frame per step. Eval factory hardcodes defaults.
 snn:
   beta: 0.9
   threshold: 1.0
@@ -84,3 +85,7 @@ train:
   # Weight peak heatmap cells vs background (unweighted MSE favors all-zeros)
   pos_weight: 100
   checkpoint_dir: checkpoints
+  # TensorBoard root; each run writes runs/<name>/<utc-timestamp>/
+  log_dir: runs
+  # Step scalars (loss, grad_norm, lr) every N optimizer steps
+  log_every: 50

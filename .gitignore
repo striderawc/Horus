@@ -8,6 +8,9 @@
 # Training checkpoints
 /checkpoints/
 
+# TensorBoard runs
+/runs/
+
 # Eval bench outputs
 /results/
 

@@ -131,6 +131,12 @@ Same 2D encoder–decoder (`BallHeatmapCNN`); only input channels change:
 
 Training hyperparams live under `train:` in [`configs/data.yaml`](configs/data.yaml) (`epochs`, `lr`, `batch_size`, `num_workers`, `pos_weight`). CLI flags override them.
 
+Every train run writes TensorBoard logs under `runs/<model>/<utc-timestamp>/` (loss, Acc@5/10, mean_px, grad norm, LR; SNN also logs per-layer activity). View with:
+
+```bash
+tensorboard --logdir runs
+```
+
 ```bash
 python scripts/train_cnn.py --modality rgb
 python scripts/train_cnn.py --modality diff
@@ -141,11 +147,13 @@ python scripts/train_diff.py
 python scripts/train_event.py
 # override config:
 python scripts/train_diff.py --epochs 20 --batch-size 8 --lr 1e-3
+# disable TB for a quick smoke run:
+python scripts/train_rgb.py --no-tensorboard --epochs 1
 ```
 
 ## Event-frame SNN
 
-`BallHeatmapSNN` uses the same `event_frame` samples as the CNN (`(6, H, W)`). It unrolls them as 3 polarity steps through a small conv-LIF encoder and writes a sigmoid heatmap from the last membrane. Leak, threshold, and width live under `snn:` in [`configs/data.yaml`](configs/data.yaml). Checkpoint: `checkpoints/event_frame_snn.pt`.
+`BallHeatmapSNN` uses the same `event_frame` samples as the CNN (`(6, H, W)`). It unrolls them as 3 polarity steps (2 channels each) through an **encoder–decoder that mirrors `BallHeatmapCNN`** (same stage widths and depth), with LIF instead of ReLU. Membranes carry across time; a sigmoid heatmap is read from the last `up1_b` membrane. Leak, threshold, and width live under `snn:` in [`configs/data.yaml`](configs/data.yaml). Checkpoint: `checkpoints/event_frame_snn.pt` (retrain after architecture changes — old shallow checkpoints will not load).
 
 ```bash
 python scripts/train_snn.py

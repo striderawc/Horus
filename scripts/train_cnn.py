@@ -17,12 +17,24 @@ from horus.config import load_config, repo_root
 from horus.data.dataset import Modality, build_dataloader
 from horus.eval.metrics import input_channels
 from horus.models import BallHeatmapCNN
-from horus.train import evaluate, train_one_epoch
+from horus.train import (
+    evaluate,
+    log_epoch_metrics,
+    log_hparams,
+    open_run_writer,
+    train_one_epoch,
+)
 
 CKPT_NAME = {
     "rgb": "rgb_cnn.pt",
     "diff": "diff_cnn.pt",
     "event_frame": "event_frame_cnn.pt",
+}
+
+RUN_NAME = {
+    "rgb": "rgb_cnn",
+    "diff": "diff_cnn",
+    "event_frame": "event_frame_cnn",
 }
 
 
@@ -40,6 +52,19 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--pos-weight", type=float, default=None, help="Peak pixel loss weight")
     p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="TensorBoard root (default: train.log_dir from config)",
+    )
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=None,
+        help="Log train step scalars every N optimizer steps",
+    )
+    p.add_argument("--no-tensorboard", action="store_true", help="Disable TensorBoard")
     args = p.parse_args()
 
     modality: Modality = args.modality  # type: ignore[assignment]
@@ -63,6 +88,9 @@ def main() -> None:
         if args.num_workers is not None
         else int(tcfg.get("num_workers", dl_cfg.get("num_workers", 0)))
     )
+    log_every = (
+        args.log_every if args.log_every is not None else int(tcfg.get("log_every", 50))
+    )
 
     ckpt_dir = Path(tcfg.get("checkpoint_dir", "checkpoints"))
     if not ckpt_dir.is_absolute():
@@ -82,27 +110,51 @@ def main() -> None:
     model = BallHeatmapCNN(in_ch=in_ch).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
+    writer = open_run_writer(
+        run_name=RUN_NAME[modality],
+        repo=repo_root(),
+        log_dir=args.log_dir,
+        disabled=args.no_tensorboard,
+        default_root=tcfg.get("log_dir", "runs"),
+    )
+
     print(
         f"modality={modality} in_ch={in_ch} device={device} "
         f"epochs={epochs} lr={lr} batch_size={bs} pos_weight={pos_weight} "
         f"train={len(train_loader.dataset)} val={len(val_loader.dataset)}"
     )
     best_px = float("inf")
+    global_step = 0
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, opt, device, pos_weight)
-        val_loss, val_px = evaluate(model, val_loader, device, pos_weight)
-        print(
-            f"epoch {epoch:03d}  train_loss={train_loss:.5f}  "
-            f"val_loss={val_loss:.5f}  val_px={val_px:.2f}"
+        train_stats, global_step = train_one_epoch(
+            model,
+            train_loader,
+            opt,
+            device,
+            pos_weight,
+            writer=writer,
+            global_step=global_step,
+            log_every=log_every,
         )
-        if val_px < best_px:
-            best_px = val_px
+        val = evaluate(model, val_loader, device, pos_weight)
+        print(
+            f"epoch {epoch:03d}  train_loss={train_stats.loss:.5f}  "
+            f"grad_norm={train_stats.grad_norm:.4f}  "
+            f"val_loss={val.loss:.5f}  val_px={val.mean_px:.2f}  "
+            f"acc@5={val.acc_at_5:.3f}  acc@10={val.acc_at_10:.3f}"
+        )
+        if writer is not None:
+            log_epoch_metrics(writer, epoch, train_stats, val, lr=lr)
+        if val.mean_px < best_px:
+            best_px = val.mean_px
             torch.save(
                 {
                     "model": model.state_dict(),
                     "epoch": epoch,
-                    "val_px": val_px,
-                    "val_loss": val_loss,
+                    "val_px": val.mean_px,
+                    "val_loss": val.loss,
+                    "acc_at_5": val.acc_at_5,
+                    "acc_at_10": val.acc_at_10,
                     "pos_weight": pos_weight,
                     "modality": modality,
                     "in_ch": in_ch,
@@ -110,6 +162,25 @@ def main() -> None:
                 ckpt_path,
             )
             print(f"  saved {ckpt_path} (best val_px={best_px:.2f})")
+
+    if writer is not None:
+        log_hparams(
+            writer,
+            {
+                "modality": modality,
+                "arch": RUN_NAME[modality],
+                "epochs": epochs,
+                "lr": lr,
+                "batch_size": bs,
+                "pos_weight": pos_weight,
+                "in_ch": in_ch,
+            },
+            {
+                "hparam/best_val_px": best_px if best_px < float("inf") else float("nan"),
+            },
+        )
+        writer.flush()
+        writer.close()
 
 
 if __name__ == "__main__":
