@@ -64,7 +64,7 @@ def summarize_activity(
     trace: SNNActivityTrace,
     hyperactive_threshold: float = DEFAULT_HYPERACTIVE_THRESHOLD,
 ) -> dict[str, dict[str, float]]:
-    """Per-layer activity dict keyed by ``LAYER_NAMES`` (e.g. ``down1_a``)."""
+    """Per-layer activity dict keyed by ``LAYER_NAMES`` (e.g. ``lif1``)."""
     return {
         name: summarize_layer(layer, hyperactive_threshold=hyperactive_threshold)
         for name, layer in trace.items()
@@ -94,8 +94,13 @@ def measure_activity(
     *,
     max_batches: int | None = 20,
     hyperactive_threshold: float = DEFAULT_HYPERACTIVE_THRESHOLD,
+    samples_per_batch: int = 1,
 ) -> dict[str, dict[str, float]]:
     """Mean per-layer activity over up to ``max_batches`` of ``loader``.
+
+    Uses at most ``samples_per_batch`` items per loader batch (default 1) so
+    activity traces stay small — full-resolution ``(B,T,C,H,W)`` stacks for all
+    LIFs OOMs quickly when ``steps`` grows.
 
     ``max_batches=None`` uses the full loader.
     """
@@ -107,18 +112,28 @@ def measure_activity(
     totals: dict[str, dict[str, float]] = {}
     n = 0
     try:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         for batch in loader:
-            x = batch["input"].to(device)
-            _, trace = model.forward_with_activity(x)
+            # Activity logging does not need the full training batch.
+            x = batch["input"][: max(int(samples_per_batch), 1)].to(device)
+            out = model.forward_with_activity(x)
+            # With predict_uncertainty: (heat, log_sigma, trace); else (heat, trace).
+            trace = out[-1]
             _accumulate(totals, summarize_activity(trace, hyperactive_threshold))
+            del trace
+            if len(out) == 3:
+                del out
             n += 1
             if max_batches is not None and n >= max_batches:
                 break
     finally:
         model.train(was_training)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    # Ensure all layers present even on empty loader
-    for name in LAYER_NAMES:
+    # Ensure all active LIF layers present even on empty loader
+    for name in model.lif_layer_names:
         totals.setdefault(name, {k: 0.0 for k in METRIC_KEYS})
     return _average(totals, n)
 
@@ -135,6 +150,7 @@ def format_activity_line(layer: str, metrics: dict[str, float]) -> str:
 
 
 def format_activity_report(stats: dict[str, dict[str, float]]) -> str:
-    """Multi-line activity report for all layers."""
-    lines = [format_activity_line(name, stats[name]) for name in LAYER_NAMES if name in stats]
+    """Multi-line activity report for layers present in ``stats``."""
+    order = [name for name in LAYER_NAMES if name in stats]
+    lines = [format_activity_line(name, stats[name]) for name in order]
     return "\n".join(lines)

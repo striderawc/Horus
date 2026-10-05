@@ -1,0 +1,203 @@
+"""Closed-loop SSM ↔ detector crop pipeline."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Protocol, Sequence
+
+import numpy as np
+import torch
+
+from horus.data.crop import crop_chw_stack
+from horus.track.gate import gate_to_square_crop
+from horus.track.state import TrackState
+
+
+class _Tracker(Protocol):
+    def initiate(self, z: np.ndarray) -> TrackState: ...
+
+    def predict(self, state: TrackState) -> TrackState: ...
+
+    def update(
+        self,
+        state: TrackState,
+        z: np.ndarray | None,
+        *,
+        r_meas: float | None = None,
+    ) -> TrackState: ...
+
+
+@dataclass
+class TrackDetectResult:
+    """One frame of the closed loop."""
+
+    t: int
+    state: TrackState
+    crop_origin: tuple[int, int]
+    crop_size: int
+    z: np.ndarray | None
+    r_meas: float | None
+    detected: bool
+
+
+def detection_to_measurement(
+    heat: torch.Tensor,
+    log_sigma: torch.Tensor | float | None,
+    *,
+    origin: tuple[float, float],
+    peak_thresh: float = 0.3,
+    sigma_min: float = 0.5,
+    sigma_max: float = 64.0,
+) -> tuple[np.ndarray | None, float | None]:
+    """Map crop heatmap (+ optional log_σ) → full-frame ``(z, r_meas)``.
+
+    ``heat`` is ``(1, H, W)`` or ``(H, W)``. If peak < ``peak_thresh``, returns
+    ``(None, None)`` (missed detection).
+    """
+    if heat.ndim == 3:
+        heat2d = heat[0]
+    elif heat.ndim == 2:
+        heat2d = heat
+    else:
+        raise ValueError(f"expected (1,H,W) or (H,W), got {tuple(heat.shape)}")
+
+    peak = float(heat2d.max().item())
+    if peak < peak_thresh:
+        return None, None
+
+    flat = heat2d.reshape(-1)
+    idx = int(flat.argmax().item())
+    h, w = int(heat2d.shape[0]), int(heat2d.shape[1])
+    y_c = float(idx // w)
+    x_c = float(idx % w)
+    x0, y0 = float(origin[0]), float(origin[1])
+    z = np.array([x_c + x0, y_c + y0], dtype=np.float64)
+
+    if log_sigma is None:
+        return z, None
+    if isinstance(log_sigma, torch.Tensor):
+        log_s = float(log_sigma.reshape(-1)[0].item())
+    else:
+        log_s = float(log_sigma)
+    sigma = float(np.exp(log_s))
+    sigma = max(sigma_min, min(sigma, sigma_max))
+    return z, sigma
+
+
+def run_track_detect_loop(
+    tracker: _Tracker,
+    *,
+    z0: np.ndarray,
+    frame_stacks: Sequence[torch.Tensor | np.ndarray],
+    detect_fn: Callable[
+        [torch.Tensor, int, int, int],
+        tuple[torch.Tensor, torch.Tensor | float | None],
+    ],
+    img_w: int,
+    img_h: int,
+    buckets: Sequence[int] = (64, 128, 256),
+    n_sigma: float = 3.0,
+    peak_thresh: float = 0.3,
+) -> list[TrackDetectResult]:
+    """Predict → gate crop → detect → update for each frame after ``z0``.
+
+    ``frame_stacks[t]`` is the modality tensor ``(C, H, W)`` for the temporal
+    window ending at frame ``t`` (already at training resolution).
+    ``detect_fn(crop, x0, y0, size)`` returns ``(heatmap, log_sigma|None)``.
+
+    Frame 0 is initiated from ``z0`` without a detector call; subsequent frames
+    run the full loop. Length of results equals ``len(frame_stacks)``.
+    """
+    if not frame_stacks:
+        return []
+
+    state = tracker.initiate(np.asarray(z0, dtype=np.float64).reshape(2))
+    results: list[TrackDetectResult] = [
+        TrackDetectResult(
+            t=0,
+            state=state,
+            crop_origin=(0, 0),
+            crop_size=0,
+            z=np.asarray(z0, dtype=np.float64).reshape(2),
+            r_meas=None,
+            detected=True,
+        )
+    ]
+
+    for t in range(1, len(frame_stacks)):
+        state = tracker.predict(state)
+        x0, y0, size = gate_to_square_crop(
+            state,
+            buckets=buckets,
+            img_w=img_w,
+            img_h=img_h,
+            n_sigma=n_sigma,
+        )
+        stack = frame_stacks[t]
+        if isinstance(stack, np.ndarray):
+            stack_t = torch.from_numpy(np.asarray(stack))
+        else:
+            stack_t = stack
+        crop = crop_chw_stack(stack_t, x0, y0, size)
+        heat, log_sigma = detect_fn(crop, x0, y0, size)
+        z, r = detection_to_measurement(
+            heat.detach().cpu() if isinstance(heat, torch.Tensor) else heat,
+            log_sigma.detach().cpu()
+            if isinstance(log_sigma, torch.Tensor)
+            else log_sigma,
+            origin=(x0, y0),
+            peak_thresh=peak_thresh,
+        )
+        state = tracker.update(state, z, r_meas=r)
+        results.append(
+            TrackDetectResult(
+                t=t,
+                state=state,
+                crop_origin=(x0, y0),
+                crop_size=size,
+                z=z,
+                r_meas=r,
+                detected=z is not None,
+            )
+        )
+    return results
+
+
+def stub_detect_fn(
+    true_xy: Sequence[np.ndarray | None],
+    *,
+    noise_sigma: float = 2.0,
+    miss_prob: float = 0.0,
+    rng: np.random.Generator | None = None,
+) -> Callable[
+    [torch.Tensor, int, int, int],
+    tuple[torch.Tensor, torch.Tensor | float | None],
+]:
+    """Oracle stub detector for smoke tests (writes a delta peak at true xy)."""
+    rng = rng or np.random.default_rng(0)
+    call_t = {"i": 0}
+
+    def _detect(
+        crop: torch.Tensor, x0: int, y0: int, size: int
+    ) -> tuple[torch.Tensor, float | None]:
+        # Advance index: caller runs detect starting at t=1.
+        call_t["i"] += 1
+        t = call_t["i"]
+        heat = torch.zeros(1, size, size, dtype=torch.float32)
+        if t >= len(true_xy) or true_xy[t] is None:
+            return heat, None
+        if miss_prob > 0 and float(rng.random()) < miss_prob:
+            return heat, float(np.log(max(noise_sigma, 0.5)))
+        xy = np.asarray(true_xy[t], dtype=np.float64).reshape(2)
+        if noise_sigma > 0:
+            xy = xy + rng.normal(0.0, noise_sigma, size=2)
+        xc = float(xy[0] - x0)
+        yc = float(xy[1] - y0)
+        ix = int(round(xc))
+        iy = int(round(yc))
+        if 0 <= ix < size and 0 <= iy < size:
+            heat[0, iy, ix] = 1.0
+            return heat, float(np.log(max(noise_sigma, 0.5)))
+        return heat, float(np.log(max(noise_sigma, 0.5)))
+
+    return _detect

@@ -1,7 +1,7 @@
-"""Convolutional LIF network: event frames → Gaussian ball heatmap.
+"""Convolutional LIF network: event frames → full-resolution ball heatmap.
 
-Architecture mirrors ``BallHeatmapCNN`` (encoder–decoder, same widths) but
-replaces ReLU with LIF and unrolls one polarity frame per timestep.
+Shallow 2-LIF encoder at native resolution (no stride / pool), then a 1×1
+head + sigmoid → ``(B, 1, H, W)``.
 """
 
 from __future__ import annotations
@@ -10,15 +10,15 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Width of the fast-sigmoid surrogate. Wider than a step, narrow enough to
 # stay local to the threshold (same default snnTorch uses).
 _SURROGATE_SLOPE = 25.0
 
-# Spatial stages matching BallHeatmapCNN; each has two LIFs (_a / _b).
-STAGE_NAMES = ("down1", "down2", "down3", "bottleneck", "up3", "up2", "up1")
-LAYER_NAMES = tuple(f"{stage}_{ab}" for stage in STAGE_NAMES for ab in ("a", "b"))
+# Activity / logging order for the two LIF layers.
+LAYER_NAMES = ("lif1", "lif2")
+# Alias kept for notebook / export compatibility (one name per LIF).
+STAGE_NAMES = LAYER_NAMES
 
 
 class _Spike(torch.autograd.Function):
@@ -62,39 +62,6 @@ class LIF(nn.Module):
         return spike, v_next, v
 
 
-class LifBlock(nn.Module):
-    """Conv→BN→LIF→Conv→BN→LIF — SNN counterpart of CNN ``_block``."""
-
-    def __init__(
-        self,
-        in_ch: int,
-        out_ch: int,
-        beta: float = 0.9,
-        threshold: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.out_ch = out_ch
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_ch)
-        self.lif_a = LIF(beta, threshold)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_ch)
-        self.lif_b = LIF(beta, threshold)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        v_a: torch.Tensor,
-        v_b: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(spike_b, v_a, v_b, spike_a, mem_a, mem_b)``."""
-        current = self.bn1(self.conv1(x))
-        s_a, v_a, m_a = self.lif_a(current, v_a)
-        current = self.bn2(self.conv2(s_a))
-        s_b, v_b, m_b = self.lif_b(current, v_b)
-        return s_b, v_a, v_b, s_a, m_a, m_b
-
-
 @dataclass
 class LayerActivity:
     """Per-LIF spike and pre-reset membrane stacks over time.
@@ -120,12 +87,16 @@ class SNNActivityTrace:
 
 
 class BallHeatmapSNN(nn.Module):
-    """CNN-matched conv-LIF encoder–decoder on polarity frames → heatmap.
+    """Shallow 2-LIF conv encoder on polarity frames → full-res heatmap.
 
     Input is the stacked event-frame window ``(B, steps * in_ch, H, W)``
-    (default 3 steps × 2 polarity channels). Each step runs the full
-    encoder–decoder with LIF activations; membranes carry across time. The
-    head reads the last pre-reset membrane of ``up1_b``.
+    (default 3 steps × 2 polarity channels). Each step runs:
+
+    ``conv1→BN→LIF1`` → ``conv2→BN→LIF2`` (both stride-1, full res) →
+    ``1×1 head → sigmoid`` ``(B, 1, H, W)``.
+
+    With ``drop_last_lif=True``, ``lif2`` is replaced by ReLU so the head
+    reads continuous features — useful as an overfit / ablation check.
     """
 
     def __init__(
@@ -135,113 +106,68 @@ class BallHeatmapSNN(nn.Module):
         base: int = 16,
         beta: float = 0.9,
         threshold: float = 1.0,
+        drop_last_lif: bool = False,
+        *,
+        predict_uncertainty: bool = False,
     ) -> None:
         super().__init__()
         self.in_ch = in_ch
         self.steps = steps
         self.base = base
-        b, b2, b4 = base, base * 2, base * 4
-        # Channel width at each LIF (both _a and _b of a stage share width).
-        self._lif_channels = {
-            "down1_a": b,
-            "down1_b": b,
-            "down2_a": b2,
-            "down2_b": b2,
-            "down3_a": b4,
-            "down3_b": b4,
-            "bottleneck_a": b4,
-            "bottleneck_b": b4,
-            "up3_a": b2,
-            "up3_b": b2,
-            "up2_a": b,
-            "up2_b": b,
-            "up1_a": b,
-            "up1_b": b,
-        }
-        self.down1 = LifBlock(in_ch, b, beta, threshold)
-        self.down2 = LifBlock(b, b2, beta, threshold)
-        self.down3 = LifBlock(b2, b4, beta, threshold)
-        self.pool = nn.MaxPool2d(2)
-        self.bottleneck = LifBlock(b4, b4, beta, threshold)
-        self.up3 = LifBlock(b4, b2, beta, threshold)
-        self.up2 = LifBlock(b2, b, beta, threshold)
-        self.up1 = LifBlock(b, b, beta, threshold)
-        self.head = nn.Conv2d(b, 1, 1)
+        self.drop_last_lif = bool(drop_last_lif)
+        self.predict_uncertainty = bool(predict_uncertainty)
+        self.lif_layer_names = ("lif1",) if self.drop_last_lif else LAYER_NAMES
 
-    def _spatial_sizes(self, height: int, width: int) -> dict[str, tuple[int, int]]:
-        """Native (H, W) for each LIF given input resolution."""
-        h, w = height, width
-        h2, w2 = h // 2, w // 2
-        h4, w4 = h // 4, w // 4
-        h8, w8 = h // 8, w // 8
-        return {
-            "down1_a": (h, w),
-            "down1_b": (h, w),
-            "down2_a": (h2, w2),
-            "down2_b": (h2, w2),
-            "down3_a": (h4, w4),
-            "down3_b": (h4, w4),
-            "bottleneck_a": (h8, w8),
-            "bottleneck_b": (h8, w8),
-            "up3_a": (h4, w4),
-            "up3_b": (h4, w4),
-            "up2_a": (h2, w2),
-            "up2_b": (h2, w2),
-            "up1_a": (h, w),
-            "up1_b": (h, w),
-        }
+        hidden = base * 2
+        self.conv1 = nn.Conv2d(in_ch, base, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(base)
+        self.lif1 = LIF(beta, threshold)
+        self.conv2 = nn.Conv2d(base, hidden, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(hidden)
+        if self.drop_last_lif:
+            self.lif2 = None
+            self.act2 = nn.ReLU(inplace=True)
+        else:
+            self.lif2 = LIF(beta, threshold)
+            self.act2 = None
+        self.head = nn.Conv2d(hidden, 1, kernel_size=1)
+        if self.predict_uncertainty:
+            self.sigma_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(hidden, 1),
+            )
+            nn.init.constant_(self.sigma_head[-1].bias, 1.6)
+        else:
+            self.sigma_head = None
 
-    def _init_membranes(
-        self,
-        ref: torch.Tensor,
-        batch: int,
-        height: int,
-        width: int,
-    ) -> dict[str, torch.Tensor]:
-        sizes = self._spatial_sizes(height, width)
-        return {
-            name: ref.new_zeros(batch, self._lif_channels[name], *sizes[name])
-            for name in LAYER_NAMES
-        }
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        heat, log_sigma, _ = self._forward_impl(x, collect=False)
+        if self.sigma_head is None:
+            return heat
+        assert log_sigma is not None
+        return heat, log_sigma
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        heatmap, _ = self._forward_impl(x, collect=False)
-        return heatmap
-
-    def forward_with_activity(self, x: torch.Tensor) -> tuple[torch.Tensor, SNNActivityTrace]:
-        """Heatmap plus per-layer spike/membrane stacks over time."""
-        heatmap, trace = self._forward_impl(x, collect=True)
+    def forward_with_activity(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, SNNActivityTrace] | tuple[
+        torch.Tensor, torch.Tensor, SNNActivityTrace
+    ]:
+        """Heatmap ``(B, 1, H, W)`` plus per-layer spike/membrane stacks."""
+        heat, log_sigma, trace = self._forward_impl(x, collect=True)
         assert trace is not None
-        return heatmap, trace
-
-    def _run_block(
-        self,
-        block: LifBlock,
-        stage: str,
-        x: torch.Tensor,
-        membranes: dict[str, torch.Tensor],
-        collected: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run one LifBlock; update membranes; optionally record activity.
-
-        Returns ``(spike_b, pre_reset_mem_b)``.
-        """
-        key_a, key_b = f"{stage}_a", f"{stage}_b"
-        s_b, v_a, v_b, s_a, m_a, m_b = block(x, membranes[key_a], membranes[key_b])
-        membranes[key_a] = v_a
-        membranes[key_b] = v_b
-        if collected is not None:
-            collected[key_a][0].append(s_a)
-            collected[key_a][1].append(m_a)
-            collected[key_b][0].append(s_b)
-            collected[key_b][1].append(m_b)
-        return s_b, m_b
+        if self.sigma_head is None:
+            return heat, trace
+        assert log_sigma is not None
+        return heat, log_sigma, trace
 
     def _forward_impl(
         self,
         x: torch.Tensor,
         collect: bool,
-    ) -> tuple[torch.Tensor, SNNActivityTrace | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, SNNActivityTrace | None]:
         # x: (B, steps * in_ch, H, W)
         b, c, h, w = x.shape
         expected = self.steps * self.in_ch
@@ -250,34 +176,42 @@ class BallHeatmapSNN(nn.Module):
         x = torch.log1p(x.clamp_min(0))
         x = x.view(b, self.steps, self.in_ch, h, w)
 
-        membranes = self._init_membranes(x, b, h, w)
+        hidden = self.conv2.out_channels
+        v1 = x.new_zeros(b, self.conv1.out_channels, h, w)
+        v2 = x.new_zeros(b, hidden, h, w)
+
         collected: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] | None = None
         if collect:
-            collected = {name: ([], []) for name in LAYER_NAMES}
+            collected = {name: ([], []) for name in self.lif_layer_names}
 
-        membrane_out: torch.Tensor | None = None
+        head_features: torch.Tensor | None = None
         for t in range(self.steps):
-            s, _ = self._run_block(self.down1, "down1", x[:, t], membranes, collected)
-            s, _ = self._run_block(self.down2, "down2", self.pool(s), membranes, collected)
-            # Encoder spatial sizes for upsample targets (no skip concat).
-            size_d2 = s.shape[-2:]
-            s, _ = self._run_block(self.down3, "down3", self.pool(s), membranes, collected)
-            size_d3 = s.shape[-2:]
-            s, _ = self._run_block(
-                self.bottleneck, "bottleneck", self.pool(s), membranes, collected
-            )
-            s = F.interpolate(s, size=size_d3, mode="bilinear", align_corners=False)
-            s, _ = self._run_block(self.up3, "up3", s, membranes, collected)
-            s = F.interpolate(s, size=size_d2, mode="bilinear", align_corners=False)
-            s, _ = self._run_block(self.up2, "up2", s, membranes, collected)
-            s = F.interpolate(s, size=(h, w), mode="bilinear", align_corners=False)
-            _, membrane_out = self._run_block(self.up1, "up1", s, membranes, collected)
+            current = self.bn1(self.conv1(x[:, t]))
+            spike, v1, m1 = self.lif1(current, v1)
+            if collected is not None:
+                collected["lif1"][0].append(spike.detach().cpu())
+                collected["lif1"][1].append(m1.detach().cpu())
 
-        assert membrane_out is not None
-        heatmap = torch.sigmoid(self.head(membrane_out))
+            current = self.bn2(self.conv2(spike))
+            if self.drop_last_lif:
+                assert self.act2 is not None
+                head_features = self.act2(current)
+            else:
+                assert self.lif2 is not None
+                spike2, v2, m2 = self.lif2(current, v2)
+                head_features = m2
+                if collected is not None:
+                    collected["lif2"][0].append(spike2.detach().cpu())
+                    collected["lif2"][1].append(m2.detach().cpu())
+
+        assert head_features is not None
+        heat = torch.sigmoid(self.head(head_features))
+        log_sigma = None
+        if self.sigma_head is not None:
+            log_sigma = self.sigma_head(head_features).squeeze(-1)
 
         if not collect:
-            return heatmap, None
+            return heat, log_sigma, None
 
         assert collected is not None
 
@@ -289,6 +223,6 @@ class BallHeatmapSNN(nn.Module):
                 spikes=_stack(collected[name][0]),
                 membrane=_stack(collected[name][1]),
             )
-            for name in LAYER_NAMES
+            for name in self.lif_layer_names
         }
-        return heatmap, SNNActivityTrace(layers=layers)
+        return heat, log_sigma, SNNActivityTrace(layers=layers)

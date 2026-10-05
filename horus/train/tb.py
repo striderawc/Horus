@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+import torch
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -72,3 +73,48 @@ def log_hparams(
         else:
             clean[key] = str(value)
     writer.add_hparams(dict(clean), {k: float(v) for k, v in metrics.items()})
+
+
+def _to_hw01(heat: torch.Tensor) -> torch.Tensor:
+    """Squeeze to ``(H, W)`` float in ``[0, 1]`` for display."""
+    x = heat.detach().float().cpu()
+    while x.ndim > 2:
+        x = x[0]
+    return x.clamp(0.0, 1.0)
+
+
+def heatmap_compare_image(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Build a ``(3, H, 3W)`` RGB strip: GT | pred | |pred−GT|."""
+    g = _to_hw01(target)
+    p = _to_hw01(pred)
+    if g.shape != p.shape:
+        raise ValueError(f"heatmap shape mismatch: gt={tuple(g.shape)} pred={tuple(p.shape)}")
+    err = (p - g).abs()
+    # Fake RGB so TensorBoard shows greyscale panels side-by-side.
+    panels = [g, p, err]
+    row = torch.cat(panels, dim=1)  # (H, 3W)
+    return row.unsqueeze(0).expand(3, -1, -1).contiguous()
+
+
+def log_heatmap_images(
+    writer: SummaryWriter,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    step: int,
+    *,
+    tag: str = "debug/heatmap_gt_pred_abserr",
+    max_samples: int = 1,
+) -> None:
+    """Log GT / pred / abs-error strips for the first ``max_samples`` items."""
+    if pred.ndim != 4 or target.ndim != 4:
+        raise ValueError(
+            f"expected pred/target (B,1,H,W), got {tuple(pred.shape)} / {tuple(target.shape)}"
+        )
+    n = min(int(max_samples), pred.shape[0], target.shape[0])
+    for i in range(n):
+        image = heatmap_compare_image(pred[i], target[i])
+        sample_tag = tag if n == 1 else f"{tag}/sample{i}"
+        writer.add_image(sample_tag, image, step, dataformats="CHW")

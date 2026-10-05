@@ -44,6 +44,60 @@ def test_heatmap_to_coords_roundtrip():
     assert torch.equal(xy, torch.tensor([[2.0, 5.0]]))
 
 
+def test_soft_heatmap_to_coords_near_peak():
+    from horus.models import soft_heatmap_to_coords
+
+    heat = torch.zeros(1, 1, 8, 8)
+    heat[0, 0, 5, 2] = 1.0
+    xy = soft_heatmap_to_coords(heat, temperature=0.01)
+    assert abs(float(xy[0, 0]) - 2.0) < 0.05
+    assert abs(float(xy[0, 1]) - 5.0) < 0.05
+
+
+def test_coord_distance_loss_zero_at_peak():
+    from horus.models import coord_distance_loss
+
+    heat = torch.zeros(2, 1, 8, 8)
+    heat[0, 0, 5, 2] = 1.0
+    heat[1, 0, 1, 4] = 1.0
+    coords = torch.tensor([[2.0, 5.0], [4.0, 1.0]])
+    visible = torch.tensor([1.0, 1.0])
+    loss = coord_distance_loss(heat, coords, visible, temperature=0.01)
+    assert float(loss) < 1e-5
+    # Invisible sample ignored
+    loss_mask = coord_distance_loss(
+        heat, coords, torch.tensor([1.0, 0.0]), temperature=0.01
+    )
+    assert float(loss_mask) < 1e-5
+
+
+def test_coord_distance_loss_matches_val_px_scaled():
+    from horus.models import coord_distance_loss
+
+    heat = torch.zeros(2, 1, 8, 8)
+    heat[0, 0, 0, 0] = 1.0
+    heat[1, 0, 7, 7] = 1.0
+    coords = torch.tensor([[3.0, 4.0], [1.0, 1.0]])
+    visible = torch.tensor([1.0, 1.0])
+    loss = coord_distance_loss(heat, coords, visible)
+    dists = visible_pixel_distances(heat, coords, visible)
+    diag = (7**2 + 7**2) ** 0.5
+    assert abs(float(loss) - float(dists.mean()) / diag) < 1e-5
+
+
+def test_coord_distance_loss_normalized_xy():
+    from horus.models import coord_distance_loss
+
+    # pred center of 8x8 → pixel (3.5, 3.5); target (0,0); / diagonal
+    pred = torch.tensor([[0.5, 0.5]])
+    coords = torch.tensor([[0.0, 0.0]])
+    loss = coord_distance_loss(pred, coords, height=8, width=8)
+    pixel = (2 * 3.5**2) ** 0.5
+    diag = (7**2 + 7**2) ** 0.5
+    assert abs(float(loss) - pixel / diag) < 1e-5
+    assert 0.0 < float(loss) <= 1.0 + 1e-5
+
+
 def test_input_channels():
     cfg = {
         "sequence": {"length": 3},

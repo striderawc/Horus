@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from horus.models import heatmap_to_coords
+from horus.models import pred_to_pixel_coords
 
 
 @dataclass(frozen=True)
@@ -22,15 +22,24 @@ class AccuracyResult:
 
 
 def visible_pixel_distances(
-    pred_heat: torch.Tensor,
+    pred: torch.Tensor,
     gt_coords: torch.Tensor,
     visible: torch.Tensor,
+    *,
+    height: int | None = None,
+    width: int | None = None,
 ) -> torch.Tensor:
-    """Euclidean pixel error for visible samples. Returns ``(N_vis,)``."""
+    """Euclidean pixel error for visible samples. Returns ``(N_vis,)``.
+
+    ``pred`` is either a heatmap ``(B, 1, H, W)`` or normalized coords ``(B, 2)``.
+    For normalized coords, pass the input ``height`` / ``width``.
+    """
     mask = visible > 0.5
     if not mask.any():
-        return pred_heat.new_empty(0)
-    pred_xy = heatmap_to_coords(pred_heat[mask])
+        return pred.new_empty(0)
+    if pred.ndim == 4 and height is None and width is None:
+        height, width = int(pred.shape[-2]), int(pred.shape[-1])
+    pred_xy = pred_to_pixel_coords(pred[mask], height=height, width=width)
     gt_xy = gt_coords[mask]
     return (pred_xy - gt_xy).norm(dim=1)
 
@@ -57,10 +66,13 @@ def measure_accuracy(
     for batch in loader:
         x = batch["input"].to(device, non_blocking=True)
         pred = model(x)
+        _, _, h, w = x.shape
         dists = visible_pixel_distances(
             pred,
             batch["coords"].to(device, non_blocking=True),
             batch["visible"].to(device, non_blocking=True),
+            height=h,
+            width=w,
         )
         if dists.numel() == 0:
             continue

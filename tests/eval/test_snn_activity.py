@@ -53,10 +53,9 @@ def test_summarize_activity_all_layers():
     zeros = torch.zeros(1, 3, 2, 4, 4)
     ones = torch.ones(1, 3, 2, 4, 4)
     layers = {name: _layer(zeros) for name in LAYER_NAMES}
-    layers["down2_b"] = _layer(ones)
+    layers["lif2"] = _layer(ones)
     trace = SNNActivityTrace(layers=layers)
     stats = summarize_activity(trace)
     assert set(stats) == set(LAYER_NAMES)
-    assert stats["down1_a"]["silent_frac"] == 1.0
-    assert stats["down2_b"]["hyperactive_frac"] == 1.0
-    assert stats["up1_b"]["spike_frac"] == 0.0
+    assert stats["lif1"]["silent_frac"] == 1.0
+    assert stats["lif2"]["hyperactive_frac"] == 1.0

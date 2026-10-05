@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from horus.config import load_config, repo_root
+from horus.config import load_config, repo_root, resolve_checkpoint_path
 from horus.data.dataset import Modality, build_dataloader
 from horus.eval.metrics import input_channels
 from horus.models import BallHeatmapCNN
@@ -50,8 +50,13 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--pos-weight", type=float, default=None, help="Peak pixel loss weight")
     p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument(
+        "--checkpoint-name",
+        type=str,
+        default=None,
+        help="Checkpoint .pt filename (overrides train.checkpoint_name in config)",
+    )
     p.add_argument(
         "--log-dir",
         type=Path,
@@ -65,19 +70,28 @@ def main() -> None:
         help="Log train step scalars every N optimizer steps",
     )
     p.add_argument("--no-tensorboard", action="store_true", help="Disable TensorBoard")
+    p.add_argument(
+        "--crop",
+        action="store_true",
+        help="Enable jittered bucket crops + log_σ head (crop.enabled in config)",
+    )
     args = p.parse_args()
 
     modality: Modality = args.modality  # type: ignore[assignment]
     cfg = load_config(args.config)
     assert int(cfg["sequence"]["length"]) == 3, "CNN expects sequence.length == 3"
 
+    if args.crop:
+        cfg.setdefault("crop", {})["enabled"] = True
+
+    crop_cfg = cfg.get("crop") or {}
+    crop_enabled = bool(crop_cfg.get("enabled", False))
+    nll_weight = float(crop_cfg.get("nll_weight", 0.1)) if crop_enabled else 0.0
+
     tcfg = cfg.setdefault("train", {})
     dl_cfg = cfg.get("dataloader", {})
     epochs = args.epochs if args.epochs is not None else int(tcfg.get("epochs", 20))
     lr = args.lr if args.lr is not None else float(tcfg.get("lr", 1e-3))
-    pos_weight = (
-        args.pos_weight if args.pos_weight is not None else float(tcfg.get("pos_weight", 100.0))
-    )
     bs = (
         args.batch_size
         if args.batch_size is not None
@@ -92,11 +106,9 @@ def main() -> None:
         args.log_every if args.log_every is not None else int(tcfg.get("log_every", 50))
     )
 
-    ckpt_dir = Path(tcfg.get("checkpoint_dir", "checkpoints"))
-    if not ckpt_dir.is_absolute():
-        ckpt_dir = repo_root() / ckpt_dir
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / CKPT_NAME[modality]
+    ckpt_path = resolve_checkpoint_path(
+        tcfg, CKPT_NAME[modality], name_override=args.checkpoint_name
+    )
 
     train_loader = build_dataloader(
         cfg, "train", modality, batch_size=bs, num_workers=nw
@@ -107,11 +119,13 @@ def main() -> None:
 
     in_ch = input_channels(modality, cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BallHeatmapCNN(in_ch=in_ch).to(device)
+    model = BallHeatmapCNN(
+        in_ch=in_ch, predict_uncertainty=crop_enabled
+    ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     writer = open_run_writer(
-        run_name=RUN_NAME[modality],
+        run_name=RUN_NAME[modality] + ("_crop" if crop_enabled else ""),
         repo=repo_root(),
         log_dir=args.log_dir,
         disabled=args.no_tensorboard,
@@ -120,7 +134,8 @@ def main() -> None:
 
     print(
         f"modality={modality} in_ch={in_ch} device={device} "
-        f"epochs={epochs} lr={lr} batch_size={bs} pos_weight={pos_weight} "
+        f"epochs={epochs} lr={lr} batch_size={bs} loss=coord_mse "
+        f"crop={crop_enabled} nll_weight={nll_weight} "
         f"train={len(train_loader.dataset)} val={len(val_loader.dataset)}"
     )
     best_px = float("inf")
@@ -131,12 +146,12 @@ def main() -> None:
             train_loader,
             opt,
             device,
-            pos_weight,
             writer=writer,
             global_step=global_step,
             log_every=log_every,
+            nll_weight=nll_weight,
         )
-        val = evaluate(model, val_loader, device, pos_weight)
+        val = evaluate(model, val_loader, device, nll_weight=nll_weight)
         print(
             f"epoch {epoch:03d}  train_loss={train_stats.loss:.5f}  "
             f"grad_norm={train_stats.grad_norm:.4f}  "
@@ -155,9 +170,11 @@ def main() -> None:
                     "val_loss": val.loss,
                     "acc_at_5": val.acc_at_5,
                     "acc_at_10": val.acc_at_10,
-                    "pos_weight": pos_weight,
                     "modality": modality,
                     "in_ch": in_ch,
+                    "loss": "coord_mse",
+                    "crop": crop_enabled,
+                    "predict_uncertainty": crop_enabled,
                 },
                 ckpt_path,
             )
@@ -172,8 +189,9 @@ def main() -> None:
                 "epochs": epochs,
                 "lr": lr,
                 "batch_size": bs,
-                "pos_weight": pos_weight,
                 "in_ch": in_ch,
+                "loss": "coord_mse",
+                "crop": crop_enabled,
             },
             {
                 "hparam/best_val_px": best_px if best_px < float("inf") else float("nan"),

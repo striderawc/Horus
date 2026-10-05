@@ -35,3 +35,28 @@ def events_clip_dir(cfg: dict[str, Any], game: str, clip: str) -> Path:
     root = Path(cfg["paths"]["processed_root"])
     sub = cfg["paths"].get("events_subdir", "events")
     return root / sub / game / clip
+
+
+def resolve_checkpoint_path(
+    train_cfg: dict[str, Any],
+    default_name: str,
+    *,
+    name_override: str | None = None,
+) -> Path:
+    """``checkpoint_dir`` / filename from config (or ``default_name``).
+
+    ``train.checkpoint_name`` or ``name_override`` wins when set. A bare stem
+    gets ``.pt`` appended. Creates the directory if needed.
+    """
+    ckpt_dir = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = repo_root() / ckpt_dir
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    raw = name_override if name_override else train_cfg.get("checkpoint_name")
+    name = str(raw).strip() if raw else default_name
+    if not name:
+        name = default_name
+    if not name.endswith(".pt"):
+        name = f"{name}.pt"
+    return ckpt_dir / name

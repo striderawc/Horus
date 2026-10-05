@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from horus.models import BallHeatmapCNN, BallHeatmapSNN
+from horus.models import BallHeatmapSNN, circle_mse_loss
 from horus.models.snn import LAYER_NAMES, STAGE_NAMES
 
 
@@ -15,6 +15,7 @@ def test_snn_forward_shape_and_backward():
     y = model(x)
     assert y.shape == (2, 1, 64, 64)
     assert torch.isfinite(y).all()
+    assert (y >= 0).all() and (y <= 1).all()
     y.sum().backward()
     grads = [p.grad for p in model.parameters() if p.requires_grad]
     assert grads
@@ -28,31 +29,19 @@ def test_forward_with_activity_shapes():
     b, h, w = 2, 64, 64
     x = torch.rand(b, 6, h, w)
     with torch.no_grad():
-        heatmap, trace = model.forward_with_activity(x)
+        heat, trace = model.forward_with_activity(x)
         plain = model(x)
 
-    assert heatmap.shape == (b, 1, h, w)
-    assert torch.allclose(heatmap, plain)
+    assert heat.shape == (b, 1, h, w)
+    assert torch.allclose(heat, plain)
 
-    b2, b4 = base * 2, base * 4
+    hidden = base * 2
     expected = {
-        "down1_a": (b, 3, base, h, w),
-        "down1_b": (b, 3, base, h, w),
-        "down2_a": (b, 3, b2, h // 2, w // 2),
-        "down2_b": (b, 3, b2, h // 2, w // 2),
-        "down3_a": (b, 3, b4, h // 4, w // 4),
-        "down3_b": (b, 3, b4, h // 4, w // 4),
-        "bottleneck_a": (b, 3, b4, h // 8, w // 8),
-        "bottleneck_b": (b, 3, b4, h // 8, w // 8),
-        "up3_a": (b, 3, b2, h // 4, w // 4),
-        "up3_b": (b, 3, b2, h // 4, w // 4),
-        "up2_a": (b, 3, base, h // 2, w // 2),
-        "up2_b": (b, 3, base, h // 2, w // 2),
-        "up1_a": (b, 3, base, h, w),
-        "up1_b": (b, 3, base, h, w),
+        "lif1": (b, 3, base, h, w),
+        "lif2": (b, 3, hidden, h, w),
     }
     assert set(LAYER_NAMES) == set(expected)
-    assert [f"{s}_{ab}" for s in STAGE_NAMES for ab in ("a", "b")] == list(LAYER_NAMES)
+    assert list(STAGE_NAMES) == list(LAYER_NAMES)
     for name in LAYER_NAMES:
         layer = trace[name]
         assert layer.spikes.shape == expected[name], name
@@ -61,11 +50,39 @@ def test_forward_with_activity_shapes():
         assert torch.isfinite(layer.membrane).all()
 
 
-def test_param_count_matches_cnn_in_ch2():
-    """Body matches BallHeatmapCNN(in_ch=2); event CNN uses in_ch=6 so first layer differs."""
+def test_shallow_param_count_scale():
+    """Two-LIF shallow encoder stays small vs the old CNN-matched U-Net."""
     snn = BallHeatmapSNN(in_ch=2, steps=3, base=16)
-    cnn = BallHeatmapCNN(in_ch=2, base=16)
     n_snn = sum(p.numel() for p in snn.parameters())
-    n_cnn = sum(p.numel() for p in cnn.parameters())
-    assert n_snn == n_cnn
-    assert n_snn > 100_000  # not the old ~14k shallow encoder
+    # ~conv1 + conv2 + 1×1 head + BN ≈ few k
+    assert 1_000 < n_snn < 20_000
+
+
+def test_drop_last_lif_forward_and_activity():
+    """Final lif2 is ReLU; activity omits lif2; forward still works."""
+    model = BallHeatmapSNN(base=8, drop_last_lif=True)
+    model.train()
+    x = torch.rand(2, 6, 64, 64)
+    y = model(x)
+    assert y.shape == (2, 1, 64, 64)
+    assert torch.isfinite(y).all()
+    y.sum().backward()
+
+    heat, trace = model.forward_with_activity(x)
+    assert heat.shape == y.shape
+    assert "lif2" not in trace.layers
+    assert set(trace.layers) == {"lif1"}
+    assert set(trace.layers) == set(model.lif_layer_names)
+
+
+def test_snn_circle_mse_loss_finite():
+    model = BallHeatmapSNN(base=8)
+    model.eval()
+    x = torch.rand(2, 6, 32, 32)
+    coords = torch.tensor([[10.0, 12.0], [20.0, 8.0]])
+    visible = torch.ones(2)
+    with torch.no_grad():
+        pred = model(x)
+    loss = circle_mse_loss(pred, coords, visible, radius=2.0)
+    assert torch.isfinite(loss)
+    assert float(loss) >= 0.0

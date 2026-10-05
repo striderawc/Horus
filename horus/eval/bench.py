@@ -54,13 +54,43 @@ def load_model(
     checkpoint: Path | str,
     device: torch.device,
 ) -> nn.Module:
-    """Build ``arch`` and load ``checkpoint['model']`` weights."""
+    """Build ``arch`` and load ``checkpoint['model']`` weights.
+
+    For ``event_frame_snn``, ``steps`` / ``drop_last_lif`` are taken from the
+    checkpoint metadata when present (defaults match ``ARCH_REGISTRY``).
+    ``predict_uncertainty`` / ``crop`` metadata enables the ``log_σ`` head.
+    """
     if arch not in ARCH_REGISTRY:
         raise KeyError(f"Unknown arch '{arch}'. Known: {sorted(ARCH_REGISTRY)}")
     factory, _ = ARCH_REGISTRY[arch]
-    model = factory().to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    meta = ckpt if isinstance(ckpt, dict) else {}
+    predict_uncertainty = bool(
+        meta.get("predict_uncertainty", meta.get("crop", False))
+    )
+
+    if arch == "event_frame_snn":
+        model = BallHeatmapSNN(
+            in_ch=2,
+            steps=int(meta.get("steps", 3)),
+            drop_last_lif=bool(meta.get("drop_last_lif", False)),
+            predict_uncertainty=predict_uncertainty,
+        ).to(device)
+    elif arch in ("rgb_cnn", "diff_cnn", "event_frame_cnn"):
+        default_ch = {"rgb_cnn": 9, "diff_cnn": 2, "event_frame_cnn": 6}[arch]
+        model = BallHeatmapCNN(
+            in_ch=int(meta.get("in_ch", default_ch)),
+            predict_uncertainty=predict_uncertainty,
+        ).to(device)
+    else:
+        if predict_uncertainty:
+            raise ValueError(
+                f"arch={arch} checkpoint requests predict_uncertainty; "
+                "add an explicit builder in load_model"
+            )
+        model = factory().to(device)
+
+    state = meta["model"] if "model" in meta else ckpt
     model.load_state_dict(state)
     model.eval()
     return model
@@ -97,15 +127,24 @@ def bench_one(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = load_model(arch, checkpoint, device)
+    snn_steps: int | None = None
+    if arch == "event_frame_snn" and isinstance(model, BallHeatmapSNN):
+        snn_steps = int(model.steps)
     dl = loader or build_dataloader(
-        cfg, split, mod, batch_size=batch_size, num_workers=num_workers, shuffle=False
+        cfg,
+        split,
+        mod,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=False,
+        input_steps=snn_steps,
     )
 
     acc: AccuracyResult = measure_accuracy(model, dl, device)
 
     img = cfg["image"]
     h, w = int(img["height"]), int(img["width"])
-    in_ch = input_channels(mod, cfg)
+    in_ch = (2 * snn_steps) if snn_steps is not None else input_channels(mod, cfg)
     flops = measure_flops(model, in_ch=in_ch, height=h, width=w, device=device)
     gflops = (flops / 1e9) if flops is not None else None
     latency_ms = measure_latency(
@@ -158,16 +197,21 @@ def bench_models(
             raise KeyError(f"Unknown arch '{arch}'. Known: {sorted(ARCH_REGISTRY)}")
         _, default_mod = ARCH_REGISTRY[arch]
         mod: Modality = spec.get("modality") or default_mod
-        if mod not in loaders:
-            loaders[mod] = build_dataloader(
-                cfg,
-                split,
-                mod,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                shuffle=False,
-            )
         name = str(spec.get("name") or Path(spec["checkpoint"]).stem)
+        # SNNs may use a non-default temporal length; let bench_one build the loader.
+        if arch == "event_frame_snn":
+            shared = None
+        else:
+            if mod not in loaders:
+                loaders[mod] = build_dataloader(
+                    cfg,
+                    split,
+                    mod,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    shuffle=False,
+                )
+            shared = loaders[mod]
         results.append(
             bench_one(
                 name=name,
@@ -181,7 +225,7 @@ def bench_models(
                 num_workers=num_workers,
                 warmup=warmup,
                 latency_runs=latency_runs,
-                loader=loaders[mod],
+                loader=shared,
             )
         )
     return results

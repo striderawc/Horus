@@ -8,6 +8,19 @@ Neuromorphic tennis ball tracker. The goal is to predict ball position over time
 
 Tracks feed later stages (court geometry → bounce location and ball speed). Models include heatmap CNNs and an event-frame SNN.
 
+## Pipeline stages
+
+1. **Tracking (`horus/track`)** — SSM stage-1 filters over ball kinematics (`cv_kf` Kalman, `cv_akf` adaptive CV, `ca_akf` adaptive CA with acceleration in the state, `cv_pf` particle filter). Filters expose `gate_window` / `snap_square_window` for uncertainty-sized detector crops and accept per-step `r_meas` from the detector.
+2. **Detection (`horus/models`)** — heatmap CNN / SNN localizers. Full-frame by default; enable `crop.enabled` (or `--crop`) for jittered bucket crops (64/128/256) with negatives and a `log_σ` head used as KF measurement noise.
+
+```bash
+python scripts/smoke_kf.py
+python scripts/smoke_kf.py --plot   # optional matplotlib path plot
+python scripts/smoke_track_detect.py --tracker cv_kf
+```
+
+Config knobs live under `tracker:` and `crop:` in [`configs/data.yaml`](configs/data.yaml).
+
 ## Dataset
 
 Uses the [TrackNet](https://nol.cs.nctu.edu.tw/ythuang/epapers/ICIP18_TrackNet.pdf) tennis dataset (place under `Dataset/`, gitignored):
@@ -129,7 +142,7 @@ Same 2D encoder–decoder (`BallHeatmapCNN`); only input channels change:
 
 `event_frame` needs precomputed `data/processed/events/<game>/<clip>/event_frames.h5` (run `convert_v2e` + `precompute_events`). Clips without those files are skipped; train **and** val games need coverage.
 
-Training hyperparams live under `train:` in [`configs/data.yaml`](configs/data.yaml) (`epochs`, `lr`, `batch_size`, `num_workers`, `pos_weight`). CLI flags override them.
+Training hyperparams live under `train:` in [`configs/data.yaml`](configs/data.yaml) (`epochs`, `lr`, `batch_size`, `num_workers`). CLI flags override them. Loss is Euclidean pixel distance / image diagonal (CNN: hard-argmax heatmap; SNN: denormalized sigmoid `(x, y)`); `val_px` stays in raw pixels.
 
 Every train run writes TensorBoard logs under `runs/<model>/<utc-timestamp>/` (loss, Acc@5/10, mean_px, grad norm, LR; SNN also logs per-layer activity). View with:
 
@@ -153,10 +166,14 @@ python scripts/train_rgb.py --no-tensorboard --epochs 1
 
 ## Event-frame SNN
 
-`BallHeatmapSNN` uses the same `event_frame` samples as the CNN (`(6, H, W)`). It unrolls them as 3 polarity steps (2 channels each) through an **encoder–decoder that mirrors `BallHeatmapCNN`** (same stage widths and depth), with LIF instead of ReLU. Membranes carry across time; a sigmoid heatmap is read from the last `up1_b` membrane. Leak, threshold, and width live under `snn:` in [`configs/data.yaml`](configs/data.yaml). Checkpoint: `checkpoints/event_frame_snn.pt` (retrain after architecture changes — old shallow checkpoints will not load).
+`BallHeatmapSNN` uses the same `event_frame` samples as the CNN (`(6, H, W)` by default). It unrolls them as polarity steps (2 channels each) through a **shallow 2-LIF encoder at full resolution** (no stride / pooling), then a **1×1 head → sigmoid** heatmap `(1, H, W)`. Train loss is **MSE** against a small disk of 1s around the ball (`snn.circle_radius`); `val_px` / Acc@k still come from the heatmap argmax. Leak, threshold, width, optional `steps`, and `repeat_frame` live under `snn:` in [`configs/data.yaml`](configs/data.yaml). Checkpoint: `checkpoints/event_frame_snn.pt` (retrain after architecture changes).
 
 ```bash
 python scripts/train_snn.py
+# overfit ablation: final lif2 is ReLU (no LIF) before the head
+python scripts/train_snn.py --overfit --drop-last-lif
+# same event frame tiled across timesteps (e,e,…,e); adjust length with --steps
+python scripts/train_snn.py --overfit --repeat-frame --steps 5
 ```
 
 ## Evaluating models
@@ -199,7 +216,7 @@ Compare multiple models with repeated `--model` specs (`name=...,ckpt=...,arch=.
 | `scripts/train_rgb.py` | Shortcut → `train_cnn --modality rgb` |
 | `scripts/train_diff.py` | Shortcut → `train_cnn --modality diff` |
 | `scripts/train_event.py` | Shortcut → `train_cnn --modality event_frame` |
-| `scripts/train_snn.py` | Train event-frame heatmap SNN |
+| `scripts/train_snn.py` | Train event-frame coord SNN |
 | `scripts/eval_models.py` | Accuracy / FLOPs / latency bench |
 | `scripts/convert_v2e.py` | Run v2e → `events.h5` (`--clip`, `--force`, `--limit`) |
 | `scripts/precompute_events.py` | Bin events → frames + voxels (same flags; skips existing) |
