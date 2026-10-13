@@ -44,9 +44,13 @@ class _TinyCNN(nn.Module):
         super().__init__()
         self.stem = nn.Conv2d(2, 2, kernel_size=1)
         self.head = nn.Conv2d(2, 1, kernel_size=1)
+        self.presence_head = nn.Linear(2, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.head(self.stem(x)))
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        feat = self.stem(x)
+        heat = self.head(feat)
+        presence = self.presence_head(feat.mean(dim=(2, 3)))
+        return heat, presence.squeeze(-1)
 
 
 def test_global_grad_norm_zero_without_grads():
@@ -60,11 +64,12 @@ def test_global_grad_norm_positive_after_backward():
     x = torch.randn(1, 2, 4, 4)
     y = torch.zeros(1, 1, 4, 4)
     y[0, 0, 1, 1] = 1.0
-    loss = ((model(x) - y) ** 2).mean()
+    heat, presence = model(x)
+    loss = ((heat - y) ** 2).mean() + presence.pow(2).mean()
     loss.backward()
     assert global_grad_norm(model) > 0.0
     layers = layer_grad_norms(model)
-    assert set(layers) == {"stem", "head"}
+    assert set(layers) == {"stem", "head", "presence_head"}
     assert all(v >= 0.0 for v in layers.values())
     # Global L2 equals RSS of per-layer L2s.
     rss = sum(v * v for v in layers.values()) ** 0.5
@@ -85,7 +90,7 @@ def test_train_one_epoch_and_evaluate_shapes():
     assert step == 2
     assert train_stats.loss >= 0.0
     assert train_stats.grad_norm >= 0.0
-    assert set(train_stats.layer_grad_norms) == {"stem", "head"}
+    assert set(train_stats.layer_grad_norms) == {"stem", "head", "presence_head"}
 
     val = evaluate(model, loader, device)
     assert isinstance(val, EvalEpochStats)

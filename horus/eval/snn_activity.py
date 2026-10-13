@@ -118,7 +118,7 @@ def measure_activity(
             # Activity logging does not need the full training batch.
             x = batch["input"][: max(int(samples_per_batch), 1)].to(device)
             out = model.forward_with_activity(x)
-            # With predict_uncertainty: (heat, log_sigma, trace); else (heat, trace).
+            # With predict_presence: (heat, presence, trace); else (heat, trace).
             trace = out[-1]
             _accumulate(totals, summarize_activity(trace, hyperactive_threshold))
             del trace

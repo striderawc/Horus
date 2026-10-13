@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from horus.models import pred_to_pixel_coords
+from horus.models import pred_to_pixel_coords, unpack_model_output
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,7 @@ def measure_accuracy(
 
     for batch in loader:
         x = batch["input"].to(device, non_blocking=True)
-        pred = model(x)
+        pred, _ = unpack_model_output(model(x))
         _, _, h, w = x.shape
         dists = visible_pixel_distances(
             pred,

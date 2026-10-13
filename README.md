@@ -10,7 +10,7 @@ Tracks feed later stages (court geometry → bounce location and ball speed). Mo
 
 ## Pipeline stages
 
-1. **Tracking (`horus/track`)** — SSM stage-1 filters over ball kinematics (`cv_kf` Kalman, `cv_akf` adaptive CV, `ca_akf` adaptive CA with acceleration in the state, `cv_pf` particle filter). Filters expose `gate_window` / `snap_square_window` for uncertainty-sized detector crops and accept per-step `r_meas` from the detector.
+1. **Tracking (`horus/track`)** — SSM stage-1 filters over ball kinematics (`cv_kf` Kalman, `cv_akf` adaptive CV, `ca_akf` adaptive CA with acceleration in the state, `cv_ekf` / `ca_ekf` EKFs with quadratic drag / optional gravity, `cv_pf` particle filter). Filters expose `gate_window` / `snap_square_window` for uncertainty-sized detector crops and accept per-step `r_meas` from the detector.
 2. **Detection (`horus/models`)** — heatmap CNN / SNN localizers. Full-frame by default; enable `crop.enabled` (or `--crop`) for jittered bucket crops (64/128/256) with negatives and a `log_σ` head used as KF measurement noise.
 
 ```bash

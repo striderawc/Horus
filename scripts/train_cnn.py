@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train BallHeatmapCNN on RGB / frame-diff / event-frame → Gaussian heatmap."""
+"""Train BallHeatmapCNN (RGB / diff / event-frame) with focal + presence."""
 
 from __future__ import annotations
 
@@ -37,6 +37,8 @@ RUN_NAME = {
     "event_frame": "event_frame_cnn",
 }
 
+LOSS = "focal_presence"
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
@@ -73,7 +75,7 @@ def main() -> None:
     p.add_argument(
         "--crop",
         action="store_true",
-        help="Enable jittered bucket crops + log_σ head (crop.enabled in config)",
+        help="Enable jittered bucket crops (crop.enabled in config)",
     )
     args = p.parse_args()
 
@@ -84,9 +86,12 @@ def main() -> None:
     if args.crop:
         cfg.setdefault("crop", {})["enabled"] = True
 
-    crop_cfg = cfg.get("crop") or {}
-    crop_enabled = bool(crop_cfg.get("enabled", False))
-    nll_weight = float(crop_cfg.get("nll_weight", 0.1)) if crop_enabled else 0.0
+    crop_enabled = bool((cfg.get("crop") or {}).get("enabled", False))
+    dcfg = cfg.get("detector") or {}
+    focal_alpha = float(dcfg.get("focal_alpha", 2.0))
+    focal_beta = float(dcfg.get("focal_beta", 4.0))
+    presence_weight = float(dcfg.get("presence_weight", 1.0))
+    presence_thresh = float(dcfg.get("presence_thresh", 0.5))
 
     tcfg = cfg.setdefault("train", {})
     dl_cfg = cfg.get("dataloader", {})
@@ -119,9 +124,7 @@ def main() -> None:
 
     in_ch = input_channels(modality, cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BallHeatmapCNN(
-        in_ch=in_ch, predict_uncertainty=crop_enabled
-    ).to(device)
+    model = BallHeatmapCNN(in_ch=in_ch, predict_presence=True).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     writer = open_run_writer(
@@ -134,8 +137,8 @@ def main() -> None:
 
     print(
         f"modality={modality} in_ch={in_ch} device={device} "
-        f"epochs={epochs} lr={lr} batch_size={bs} loss=coord_mse "
-        f"crop={crop_enabled} nll_weight={nll_weight} "
+        f"epochs={epochs} lr={lr} batch_size={bs} loss={LOSS} "
+        f"crop={crop_enabled} presence_thresh={presence_thresh} "
         f"train={len(train_loader.dataset)} val={len(val_loader.dataset)}"
     )
     best_px = float("inf")
@@ -149,9 +152,21 @@ def main() -> None:
             writer=writer,
             global_step=global_step,
             log_every=log_every,
-            nll_weight=nll_weight,
+            loss=LOSS,
+            focal_alpha=focal_alpha,
+            focal_beta=focal_beta,
+            presence_weight=presence_weight,
         )
-        val = evaluate(model, val_loader, device, nll_weight=nll_weight)
+        val = evaluate(
+            model,
+            val_loader,
+            device,
+            loss=LOSS,
+            focal_alpha=focal_alpha,
+            focal_beta=focal_beta,
+            presence_weight=presence_weight,
+            presence_thresh=presence_thresh,
+        )
         print(
             f"epoch {epoch:03d}  train_loss={train_stats.loss:.5f}  "
             f"grad_norm={train_stats.grad_norm:.4f}  "
@@ -172,9 +187,9 @@ def main() -> None:
                     "acc_at_10": val.acc_at_10,
                     "modality": modality,
                     "in_ch": in_ch,
-                    "loss": "coord_mse",
+                    "loss": LOSS,
                     "crop": crop_enabled,
-                    "predict_uncertainty": crop_enabled,
+                    "predict_presence": True,
                 },
                 ckpt_path,
             )
@@ -190,7 +205,7 @@ def main() -> None:
                 "lr": lr,
                 "batch_size": bs,
                 "in_ch": in_ch,
-                "loss": "coord_mse",
+                "loss": LOSS,
                 "crop": crop_enabled,
             },
             {

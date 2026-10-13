@@ -41,10 +41,15 @@ crop:
   negative_prob: 0.2
   # Ball must sit this many px inside the crop to count as positive
   min_ball_margin: 4
-  # Detector peak threshold for accepting a measurement (closed loop)
-  peak_thresh: 0.3
-  # Weight on Gaussian NLL (coord residual / predicted σ) during training
-  nll_weight: 0.1
+
+# Detector decode / focal loss (CNN & SNN default: focal_presence)
+detector:
+  presence_thresh: 0.5
+  presence_weight: 1.0
+  focal_alpha: 2.0
+  focal_beta: 4.0
+  # Soft-argmax temperature for peak-sharpness → r_meas
+  sharpness_temperature: 0.1
 
 frame_diff:
   # absolute | signed
@@ -82,23 +87,26 @@ dataloader:
   num_workers: 2
   shuffle_train: true
 
-# Stage-1 trackers (horus.track): cv_kf / cv_akf / ca_akf / cv_pf.
+# Stage-1 trackers (horus.track): cv_kf / cv_akf / ca_akf / cv_ekf / ca_ekf / cv_pf.
 # dt: null → 1 / source.fps. r_meas is measurement std (px) for R = r^2 I.
 tracker:
   dt: null
   q_pos: 1.0
   q_vel: 10.0
-  q_acc: 50.0          # CA process noise on ax/ay (ca_akf)
+  q_acc: 50.0          # CA process noise on ax/ay (ca_akf / ca_ekf)
   r_meas: 5.0
   init_pos_std: 10.0
   init_vel_std: 50.0
-  init_acc_std: 100.0  # CA initial accel std (ca_akf)
+  init_acc_std: 100.0  # CA initial accel std (ca_akf / ca_ekf)
   # Adaptive KF (cv_akf / ca_akf) — learns Q, R online
   akf_forgetting: 0.95
   akf_q_min: 1.0e-4
   akf_r_min: 0.25
   akf_q_max_scale: 100.0
   akf_r_max_scale: 100.0
+  # EKF (cv_ekf / ca_ekf) — quadratic drag a = -ekf_drag * ‖v‖ v; image-y gravity
+  ekf_drag: 0.0
+  ekf_gravity: 0.0     # px/s² (image y down); 0 → linear CV/CA when drag=0
   # Particle filter (ConstantVelocityPF / build_pf)
   n_particles: 500
   ess_ratio: 0.5
@@ -108,16 +116,15 @@ tracker:
 
 
 # Event-frame SNN (scripts/train_snn.py). steps = snn.steps or sequence.length.
-# Shallow 2-LIF encoder at full resolution → 1×1 head → sigmoid heatmap.
-# Train loss is MSE vs a small disk of 1s around the ball (snn.circle_radius).
-# Eval factory hardcodes defaults.
+# Shallow 2-LIF encoder at full resolution → heatmap logits + presence.
+# Default train loss is penalty-reduced focal + presence BCE (same as CNN).
 snn:
   beta: 0.9
   threshold: 1.0
   base: 16
   # Temporal unroll length (null = sequence.length)
   steps: null
-  # Pixel radius of the binary target circle for circle_mse loss
+  # Ablation only: pixel radius if using circle_mse loss
   circle_radius: 3.0
   # Ablation: feed the same event frame every timestep (e,e,…,e) instead of (e1…eT).
   # Label is that single frame. Pair with steps to control how many times it is tiled.

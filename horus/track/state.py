@@ -12,8 +12,8 @@ class TrackState:
     """Track estimate: mean and covariance.
 
     Convention:
-    - CV filters: ``[x, y, vx, vy]`` (dim 4)
-    - CA filters: ``[x, y, vx, vy, ax, ay]`` (dim 6)
+    - CV / CV-EKF filters: ``[x, y, vx, vy]`` (dim 4)
+    - CA / CA-EKF filters: ``[x, y, vx, vy, ax, ay]`` (dim 6)
 
     Particle filters may also attach ``particles`` ``(N, D)`` and ``weights``
     ``(N,)``. Kalman filters leave those as ``None``.

@@ -1,7 +1,7 @@
-"""Convolutional LIF network: event frames → full-resolution ball heatmap.
+"""Convolutional LIF network: event frames → stride-1 heatmap + presence.
 
 Shallow 2-LIF encoder at native resolution (no stride / pool), then a 1×1
-head + sigmoid → ``(B, 1, H, W)``.
+head → heatmap logits ``(B, 1, H, W)`` plus optional presence logit ``(B,)``.
 """
 
 from __future__ import annotations
@@ -87,13 +87,13 @@ class SNNActivityTrace:
 
 
 class BallHeatmapSNN(nn.Module):
-    """Shallow 2-LIF conv encoder on polarity frames → full-res heatmap.
+    """Shallow 2-LIF conv encoder on polarity frames → heatmap + presence.
 
     Input is the stacked event-frame window ``(B, steps * in_ch, H, W)``
     (default 3 steps × 2 polarity channels). Each step runs:
 
     ``conv1→BN→LIF1`` → ``conv2→BN→LIF2`` (both stride-1, full res) →
-    ``1×1 head → sigmoid`` ``(B, 1, H, W)``.
+    ``1×1 head`` heatmap logits ``(B, 1, H, W)``.
 
     With ``drop_last_lif=True``, ``lif2`` is replaced by ReLU so the head
     reads continuous features — useful as an overfit / ablation check.
@@ -108,14 +108,14 @@ class BallHeatmapSNN(nn.Module):
         threshold: float = 1.0,
         drop_last_lif: bool = False,
         *,
-        predict_uncertainty: bool = False,
+        predict_presence: bool = True,
     ) -> None:
         super().__init__()
         self.in_ch = in_ch
         self.steps = steps
         self.base = base
         self.drop_last_lif = bool(drop_last_lif)
-        self.predict_uncertainty = bool(predict_uncertainty)
+        self.predict_presence = bool(predict_presence)
         self.lif_layer_names = ("lif1",) if self.drop_last_lif else LAYER_NAMES
 
         hidden = base * 2
@@ -131,37 +131,36 @@ class BallHeatmapSNN(nn.Module):
             self.lif2 = LIF(beta, threshold)
             self.act2 = None
         self.head = nn.Conv2d(hidden, 1, kernel_size=1)
-        if self.predict_uncertainty:
-            self.sigma_head = nn.Sequential(
+        if self.predict_presence:
+            self.presence_head = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Linear(hidden, 1),
             )
-            nn.init.constant_(self.sigma_head[-1].bias, 1.6)
         else:
-            self.sigma_head = None
+            self.presence_head = None
 
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        heat, log_sigma, _ = self._forward_impl(x, collect=False)
-        if self.sigma_head is None:
+        heat, presence, _ = self._forward_impl(x, collect=False)
+        if self.presence_head is None:
             return heat
-        assert log_sigma is not None
-        return heat, log_sigma
+        assert presence is not None
+        return heat, presence
 
     def forward_with_activity(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, SNNActivityTrace] | tuple[
         torch.Tensor, torch.Tensor, SNNActivityTrace
     ]:
-        """Heatmap ``(B, 1, H, W)`` plus per-layer spike/membrane stacks."""
-        heat, log_sigma, trace = self._forward_impl(x, collect=True)
+        """Heatmap logits plus per-layer spike/membrane stacks."""
+        heat, presence, trace = self._forward_impl(x, collect=True)
         assert trace is not None
-        if self.sigma_head is None:
+        if self.presence_head is None:
             return heat, trace
-        assert log_sigma is not None
-        return heat, log_sigma, trace
+        assert presence is not None
+        return heat, presence, trace
 
     def _forward_impl(
         self,
@@ -205,13 +204,13 @@ class BallHeatmapSNN(nn.Module):
                     collected["lif2"][1].append(m2.detach().cpu())
 
         assert head_features is not None
-        heat = torch.sigmoid(self.head(head_features))
-        log_sigma = None
-        if self.sigma_head is not None:
-            log_sigma = self.sigma_head(head_features).squeeze(-1)
+        heat_logits = self.head(head_features)
+        presence = None
+        if self.presence_head is not None:
+            presence = self.presence_head(head_features).squeeze(-1)
 
         if not collect:
-            return heat, log_sigma, None
+            return heat_logits, presence, None
 
         assert collected is not None
 
@@ -225,4 +224,4 @@ class BallHeatmapSNN(nn.Module):
             )
             for name in self.lif_layer_names
         }
-        return heat, log_sigma, SNNActivityTrace(layers=layers)
+        return heat_logits, presence, SNNActivityTrace(layers=layers)

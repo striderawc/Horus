@@ -58,40 +58,51 @@ def load_model(
 
     For ``event_frame_snn``, ``steps`` / ``drop_last_lif`` are taken from the
     checkpoint metadata when present (defaults match ``ARCH_REGISTRY``).
-    ``predict_uncertainty`` / ``crop`` metadata enables the ``log_σ`` head.
+    Presence head is on by default; disabled only for legacy checkpoints that
+    lack ``presence_head`` weights.
     """
     if arch not in ARCH_REGISTRY:
         raise KeyError(f"Unknown arch '{arch}'. Known: {sorted(ARCH_REGISTRY)}")
     factory, _ = ARCH_REGISTRY[arch]
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     meta = ckpt if isinstance(ckpt, dict) else {}
-    predict_uncertainty = bool(
-        meta.get("predict_uncertainty", meta.get("crop", False))
-    )
+    state = meta["model"] if "model" in meta else ckpt
+    has_presence = any(str(k).startswith("presence_head") for k in state)
+    # Prefer explicit meta; else infer from state dict keys.
+    if "predict_presence" in meta:
+        predict_presence = bool(meta["predict_presence"])
+    elif "predict_uncertainty" in meta or "crop" in meta:
+        # Legacy crop/uncertainty checkpoints: no presence head.
+        predict_presence = has_presence
+    else:
+        predict_presence = has_presence if state else True
 
     if arch == "event_frame_snn":
         model = BallHeatmapSNN(
             in_ch=2,
             steps=int(meta.get("steps", 3)),
             drop_last_lif=bool(meta.get("drop_last_lif", False)),
-            predict_uncertainty=predict_uncertainty,
+            predict_presence=predict_presence,
         ).to(device)
     elif arch in ("rgb_cnn", "diff_cnn", "event_frame_cnn"):
         default_ch = {"rgb_cnn": 9, "diff_cnn": 2, "event_frame_cnn": 6}[arch]
         model = BallHeatmapCNN(
             in_ch=int(meta.get("in_ch", default_ch)),
-            predict_uncertainty=predict_uncertainty,
+            predict_presence=predict_presence,
         ).to(device)
     else:
-        if predict_uncertainty:
-            raise ValueError(
-                f"arch={arch} checkpoint requests predict_uncertainty; "
-                "add an explicit builder in load_model"
-            )
         model = factory().to(device)
 
-    state = meta["model"] if "model" in meta else ckpt
-    model.load_state_dict(state)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # Ignore obsolete sigma_head keys from older crop checkpoints.
+    unexpected = [k for k in unexpected if not str(k).startswith("sigma_head")]
+    if missing and predict_presence:
+        raise RuntimeError(
+            f"checkpoint missing presence weights: {missing[:5]}… "
+            f"(retrain or set predict_presence=False)"
+        )
+    if unexpected:
+        raise RuntimeError(f"unexpected keys in checkpoint: {unexpected[:8]}")
     model.eval()
     return model
 

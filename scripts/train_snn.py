@@ -33,7 +33,7 @@ CKPT_OVERFIT = "event_frame_snn_overfit.pt"
 CKPT_OVERFIT_NO_LAST = "event_frame_snn_overfit_nolastlif.pt"
 CKPT_NO_LAST = "event_frame_snn_nolastlif.pt"
 CKPT_REPEAT = "event_frame_snn_repeat.pt"
-LOSS = "circle_mse"
+LOSS = "focal_presence"
 
 
 def _subset_loader(
@@ -159,7 +159,7 @@ def main() -> None:
     p.add_argument(
         "--crop",
         action="store_true",
-        help="Enable jittered bucket crops + log_σ head (crop.enabled in config)",
+        help="Enable jittered bucket crops (crop.enabled in config)",
     )
     args = p.parse_args()
 
@@ -168,7 +168,11 @@ def main() -> None:
         cfg.setdefault("crop", {})["enabled"] = True
     crop_cfg = cfg.get("crop") or {}
     crop_enabled = bool(crop_cfg.get("enabled", False))
-    nll_weight = float(crop_cfg.get("nll_weight", 0.1)) if crop_enabled else 0.0
+    dcfg = cfg.get("detector") or {}
+    focal_alpha = float(dcfg.get("focal_alpha", 2.0))
+    focal_beta = float(dcfg.get("focal_beta", 4.0))
+    presence_weight = float(dcfg.get("presence_weight", 1.0))
+    presence_thresh = float(dcfg.get("presence_thresh", 0.5))
 
     snn_cfg = cfg.get("snn", {})
     steps = _resolve_steps(args, snn_cfg, int(cfg["sequence"]["length"]))
@@ -281,7 +285,7 @@ def main() -> None:
         beta=beta,
         threshold=threshold,
         drop_last_lif=bool(args.drop_last_lif),
-        predict_uncertainty=crop_enabled,
+        predict_presence=True,
     ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -307,7 +311,7 @@ def main() -> None:
         f"arch={ARCH} modality={modality} in_ch={in_ch} device={device} mode={mode} "
         f"drop_last_lif={bool(args.drop_last_lif)} repeat_frame={repeat_frame} "
         f"steps={steps} base={base} beta={beta} threshold={threshold} "
-        f"circle_radius={circle_radius} crop={crop_enabled} nll_weight={nll_weight} "
+        f"circle_radius={circle_radius} crop={crop_enabled} "
         f"epochs={epochs} lr={lr} batch_size={bs} loss={LOSS} "
         f"train={len(train_loader.dataset)} val={len(val_loader.dataset)} "
         f"ckpt={ckpt_path.name}"
@@ -326,7 +330,9 @@ def main() -> None:
             log_every=log_every,
             loss=LOSS,
             circle_radius=circle_radius,
-            nll_weight=nll_weight,
+            focal_alpha=focal_alpha,
+            focal_beta=focal_beta,
+            presence_weight=presence_weight,
         )
         val = evaluate(
             model,
@@ -334,7 +340,10 @@ def main() -> None:
             device,
             loss=LOSS,
             circle_radius=circle_radius,
-            nll_weight=nll_weight,
+            focal_alpha=focal_alpha,
+            focal_beta=focal_beta,
+            presence_weight=presence_weight,
+            presence_thresh=presence_thresh,
         )
         print(
             f"epoch {epoch:03d}  train_loss={train_stats.loss:.5f}  "
@@ -385,7 +394,7 @@ def main() -> None:
                     "circle_radius": circle_radius,
                     "loss": LOSS,
                     "crop": crop_enabled,
-                    "predict_uncertainty": crop_enabled,
+                    "predict_presence": True,
                 },
                 ckpt_path,
             )

@@ -1,4 +1,4 @@
-"""2D encoder–decoder CNN: 3 RGB frames → Gaussian ball heatmap."""
+"""2D encoder–decoder CNN: sequence → stride-1 ball heatmap + presence."""
 
 from __future__ import annotations
 
@@ -21,13 +21,12 @@ def _block(in_ch: int, out_ch: int) -> nn.Sequential:
 
 
 class BallHeatmapCNN(nn.Module):
-    """TrackNet-lite encoder–decoder → 1-channel Gaussian heatmap.
+    """TrackNet-lite encoder–decoder → heatmap logits + presence logit.
 
     ``in_ch``: 9 RGB, 2 frame-diff, 6 event-frame (3×2 polarity).
 
-    With ``predict_uncertainty=True``, ``forward`` returns
-    ``(heatmap, log_sigma)`` where ``log_sigma`` is ``(B,)`` from a GAP head
-    on the bottleneck (isotropic measurement noise for the tracker).
+    Forward returns ``(heatmap_logits, presence_logit)`` with shapes
+    ``(B, 1, H, W)`` and ``(B,)``. Apply sigmoid outside for viz / focal.
     """
 
     def __init__(
@@ -35,11 +34,11 @@ class BallHeatmapCNN(nn.Module):
         in_ch: int = 9,
         base: int = 16,
         *,
-        predict_uncertainty: bool = False,
+        predict_presence: bool = True,
     ) -> None:
         super().__init__()
         self.in_ch = in_ch
-        self.predict_uncertainty = bool(predict_uncertainty)
+        self.predict_presence = bool(predict_presence)
         b, b2, b4 = base, base * 2, base * 4
         self.down1 = _block(in_ch, b)
         self.down2 = _block(b, b2)
@@ -50,16 +49,14 @@ class BallHeatmapCNN(nn.Module):
         self.up2 = _block(b2, b)
         self.up1 = _block(b, b)
         self.head = nn.Conv2d(b, 1, 1)
-        if self.predict_uncertainty:
-            self.sigma_head = nn.Sequential(
+        if self.predict_presence:
+            self.presence_head = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Linear(b4, 1),
             )
-            # Init near log(5) ≈ typical tracker.r_meas
-            nn.init.constant_(self.sigma_head[-1].bias, 1.6)
         else:
-            self.sigma_head = None
+            self.presence_head = None
 
     def forward(
         self, x: torch.Tensor
@@ -78,65 +75,91 @@ class BallHeatmapCNN(nn.Module):
         x = self.up1(
             F.interpolate(x, size=d1.shape[-2:], mode="bilinear", align_corners=False)
         )
-        heat = torch.sigmoid(self.head(x))
-        if self.sigma_head is None:
-            return heat
-        log_sigma = self.sigma_head(bn).squeeze(-1)
-        return heat, log_sigma
+        heat_logits = self.head(x)
+        if self.presence_head is None:
+            return heat_logits
+        presence = self.presence_head(bn).squeeze(-1)
+        return heat_logits, presence
 
 
 def unpack_model_output(
     out: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Normalize model forward to ``(heatmap, log_sigma|None)``."""
+    """Normalize model forward to ``(heatmap_logits, presence_logit|None)``."""
     if isinstance(out, tuple):
-        heat, log_sigma = out
-        return heat, log_sigma
+        heat, presence = out
+        return heat, presence
     return out, None
 
 
-def gaussian_nll_loss(
-    pred: torch.Tensor,
-    coords: torch.Tensor,
-    log_sigma: torch.Tensor,
-    visible: torch.Tensor | None = None,
+def penalty_reduced_focal_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
     *,
-    height: int | None = None,
-    width: int | None = None,
-    temperature: float = 0.1,
-    sigma_min: float = 0.5,
-    sigma_max: float = 64.0,
+    alpha: float = 2.0,
+    beta: float = 4.0,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Gaussian NLL on heatmap peak vs GT coords (positives only).
+    """CornerNet / CenterNet penalty-reduced focal loss on a Gaussian heatmap.
 
-    ``0.5 * ((‖xŷ−xy‖/σ)² + 2 log σ)`` with σ = clamp(exp(log_σ)).
+    ``logits`` / ``target``: ``(B, 1, H, W)`` with ``target ∈ [0, 1]``.
+    Normalized by the number of positive peaks (``target == 1``), or by batch
+    size when there are no positives (all-negative / invisible crops).
     """
-    if pred.ndim == 4 and height is None and width is None:
-        height, width = int(pred.shape[-2]), int(pred.shape[-1])
-    if height is None or width is None:
-        raise ValueError("height and width are required for gaussian_nll_loss")
-    pred_xy = pred_to_pixel_coords(
-        pred, height=height, width=width, temperature=temperature
+    if logits.shape != target.shape:
+        raise ValueError(
+            f"logits/target shape mismatch: {tuple(logits.shape)} vs {tuple(target.shape)}"
+        )
+    pred = torch.sigmoid(logits).clamp(eps, 1.0 - eps)
+    pos_mask = target.eq(1.0)
+    neg_mask = ~pos_mask
+
+    pos_loss = -((1.0 - pred) ** alpha) * torch.log(pred)
+    neg_weights = (1.0 - target) ** beta
+    neg_loss = -(neg_weights) * (pred**alpha) * torch.log(1.0 - pred)
+
+    n_pos = int(pos_mask.sum().item())
+    loss = pos_loss * pos_mask.float() + neg_loss * neg_mask.float()
+    if n_pos > 0:
+        return loss.sum() / float(n_pos)
+    return loss.sum() / float(max(logits.shape[0], 1))
+
+
+def presence_bce_loss(
+    presence_logit: torch.Tensor,
+    present: torch.Tensor,
+) -> torch.Tensor:
+    """BCE-with-logits for ball-in-crop / visible presence."""
+    target = present.reshape(-1).to(
+        device=presence_logit.device, dtype=presence_logit.dtype
     )
-    log_s = log_sigma.reshape(-1)
-    if visible is not None:
-        mask = visible.reshape(-1) > 0.5
-        if not mask.any():
-            # Differentiable zero so all-negative batches still backward.
-            return pred.sum() * 0.0 + log_sigma.sum() * 0.0
-        pred_xy = pred_xy[mask]
-        coords = coords[mask]
-        log_s = log_s[mask]
-    target = coords.to(device=pred_xy.device, dtype=pred_xy.dtype)
-    # Clamp log_sigma in the loss for stability (still grads to raw head).
-    log_s = log_s.clamp(min=math.log(sigma_min), max=math.log(sigma_max))
-    residual = (pred_xy - target).norm(dim=1)
-    inv_var = torch.exp(-2.0 * log_s)
-    return (0.5 * (residual.pow(2) * inv_var + 2.0 * log_s)).mean()
+    logit = presence_logit.reshape(-1)
+    return F.binary_cross_entropy_with_logits(logit, target)
+
+
+def focal_presence_loss(
+    heat_logits: torch.Tensor,
+    presence_logit: torch.Tensor,
+    heatmap_target: torch.Tensor,
+    present: torch.Tensor,
+    *,
+    alpha: float = 2.0,
+    beta: float = 4.0,
+    presence_weight: float = 1.0,
+) -> torch.Tensor:
+    """``L_hm + λ * L_presence``."""
+    hm = penalty_reduced_focal_loss(
+        heat_logits, heatmap_target, alpha=alpha, beta=beta
+    )
+    pr = presence_bce_loss(presence_logit, present)
+    return hm + float(presence_weight) * pr
 
 
 def heatmap_to_coords(heat: torch.Tensor) -> torch.Tensor:
-    """Argmax peak of ``(B, 1, H, W)`` → ``(B, 2)`` as (x, y)."""
+    """Argmax peak of ``(B, 1, H, W)`` → ``(B, 2)`` as (x, y).
+
+    Works on logits or probabilities (argmax is unchanged by sigmoid).
+    """
     b, _, h, w = heat.shape
     flat = heat.view(b, -1)
     idx = flat.argmax(dim=1)
@@ -166,6 +189,30 @@ def soft_heatmap_to_coords(
     x = (weights * grid_x).sum(dim=1)
     y = (weights * grid_y).sum(dim=1)
     return torch.stack([x, y], dim=1)
+
+
+def soft_heatmap_spatial_std(
+    heat: torch.Tensor,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """Isotropic soft spatial std ``(B,)`` from softmax mass (peak sharpness).
+
+    Sharper peaks → smaller std. ``heat`` may be logits or probabilities.
+    """
+    b, _, h, w = heat.shape
+    flat = heat.reshape(b, -1)
+    weights = torch.softmax(flat / max(float(temperature), 1e-6), dim=1)
+    device, dtype = heat.device, heat.dtype
+    xs = torch.arange(w, device=device, dtype=dtype)
+    ys = torch.arange(h, device=device, dtype=dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    grid_x = grid_x.reshape(-1)
+    grid_y = grid_y.reshape(-1)
+    mean_x = (weights * grid_x).sum(dim=1)
+    mean_y = (weights * grid_y).sum(dim=1)
+    var_x = (weights * (grid_x - mean_x[:, None]).pow(2)).sum(dim=1)
+    var_y = (weights * (grid_y - mean_y[:, None]).pow(2)).sum(dim=1)
+    return torch.sqrt(0.5 * (var_x + var_y) + 1e-8)
 
 
 def pred_to_pixel_coords(
@@ -204,13 +251,7 @@ def coord_distance_loss(
     width: int | None = None,
     temperature: float = 0.1,
 ) -> torch.Tensor:
-    """Mean Euclidean error / image diagonal (so a corner-to-corner miss is ~1).
-
-    Pixel distance is divided by ``sqrt((W-1)^2 + (H-1)^2)`` so grads are
-    resolution-independent. ``val_px`` stays in raw pixels.
-
-    For heatmaps, peak is hard-argmax (STE soft grads). For normalized
-    ``(B, 2)`` outputs, pass input ``height`` / ``width`` to denormalize.
+    """Mean Euclidean error / image diagonal (ablation).
 
     Invisible samples (``visible <= 0.5``) are skipped; if none remain, returns 0.
     """
@@ -225,7 +266,6 @@ def coord_distance_loss(
     if visible is not None:
         mask = visible.reshape(-1) > 0.5
         if not mask.any():
-            # Differentiable zero so all-negative batches still backward.
             return pred.sum() * 0.0
         pred_xy = pred_xy[mask]
         coords = coords[mask]
@@ -240,11 +280,7 @@ def weighted_heatmap_mse(
     target: torch.Tensor,
     pos_weight: float = 100.0,
 ) -> torch.Tensor:
-    """MSE with higher weight on ball pixels (target intensity).
-
-    Background stays weight 1; peak cells scale up to ``pos_weight``. Kept for
-    ablations; training now uses ``coord_distance_loss`` by default.
-    """
+    """MSE with higher weight on ball pixels (ablation)."""
     w = 1.0 + (pos_weight - 1.0) * target
     return (w * (pred - target).pow(2)).mean()
 
@@ -273,14 +309,10 @@ def circle_mse_loss(
     *,
     radius: float = 3.0,
 ) -> torch.Tensor:
-    """MSE of sigmoid heatmap ``(B, 1, H, W)`` vs a disk of 1s around each ball.
-
-    Invisible samples get an all-zero target (still supervised). Builds the
-    circle from pixel ``coords`` so the dataset can keep Gaussian heatmaps for
-    the CNN path.
-    """
-    target = _circle_target(pred, coords, visible, radius)
-    return torch.nn.functional.mse_loss(pred, target)
+    """MSE of sigmoid heatmap vs a disk (ablation). Accepts logits or probs."""
+    probs = torch.sigmoid(pred) if pred.min() < 0 or pred.max() > 1 else pred
+    target = _circle_target(probs, coords, visible, radius)
+    return torch.nn.functional.mse_loss(probs, target)
 
 
 def circle_bce_loss(
@@ -290,10 +322,7 @@ def circle_bce_loss(
     *,
     radius: float = 3.0,
 ) -> torch.Tensor:
-    """BCE of sigmoid heatmap ``(B, 1, H, W)`` vs a disk of 1s around each ball.
-
-    Invisible samples get an all-zero target (still supervised). Kept for
-    ablations; SNN training defaults to ``circle_mse_loss``.
-    """
-    target = _circle_target(pred, coords, visible, radius)
-    return torch.nn.functional.binary_cross_entropy(pred, target)
+    """BCE of sigmoid heatmap vs a disk (ablation). Accepts logits or probs."""
+    probs = torch.sigmoid(pred) if pred.min() < 0 or pred.max() > 1 else pred
+    target = _circle_target(probs, coords, visible, radius)
+    return torch.nn.functional.binary_cross_entropy(probs, target)

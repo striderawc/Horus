@@ -18,6 +18,8 @@ from horus.config import load_config
 from horus.track import (
     build_akf,
     build_ca_akf,
+    build_ca_ekf,
+    build_ekf,
     build_kf,
     build_pf,
     run_track_detect_loop,
@@ -31,7 +33,7 @@ def main() -> None:
     p.add_argument("--config", type=Path, default=None)
     p.add_argument(
         "--tracker",
-        choices=["cv_kf", "cv_akf", "ca_akf", "cv_pf"],
+        choices=["cv_kf", "cv_akf", "ca_akf", "cv_ekf", "ca_ekf", "cv_pf"],
         default="cv_kf",
     )
     p.add_argument("--steps", type=int, default=30)
@@ -48,6 +50,8 @@ def main() -> None:
         "cv_kf": build_kf,
         "cv_akf": build_akf,
         "ca_akf": build_ca_akf,
+        "cv_ekf": build_ekf,
+        "ca_ekf": build_ca_ekf,
         "cv_pf": build_pf,
     }
     tracker = builders[args.tracker](cfg)
@@ -69,7 +73,7 @@ def main() -> None:
         img_w=img_w,
         img_h=img_h,
         buckets=buckets,
-        peak_thresh=0.3,
+        presence_thresh=float((cfg.get("detector") or {}).get("presence_thresh", 0.5)),
     )
 
     n_det = sum(1 for r in results if r.detected)

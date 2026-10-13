@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from horus.data.crop import crop_chw_stack
+from horus.models.cnn import soft_heatmap_spatial_std
 from horus.track.gate import gate_to_square_crop
 from horus.track.state import TrackState
 
@@ -42,17 +43,19 @@ class TrackDetectResult:
 
 def detection_to_measurement(
     heat: torch.Tensor,
-    log_sigma: torch.Tensor | float | None,
+    presence: torch.Tensor | float | None,
     *,
     origin: tuple[float, float],
-    peak_thresh: float = 0.3,
+    presence_thresh: float = 0.5,
     sigma_min: float = 0.5,
     sigma_max: float = 64.0,
+    temperature: float = 0.1,
 ) -> tuple[np.ndarray | None, float | None]:
-    """Map crop heatmap (+ optional log_σ) → full-frame ``(z, r_meas)``.
+    """Map crop heatmap (+ presence) → full-frame ``(z, r_meas)``.
 
-    ``heat`` is ``(1, H, W)`` or ``(H, W)``. If peak < ``peak_thresh``, returns
-    ``(None, None)`` (missed detection).
+    ``heat`` is logits or probs ``(1, H, W)`` / ``(H, W)``. Misses when
+    ``sigmoid(presence) < presence_thresh``. ``r_meas`` is the soft spatial
+    std of the heatmap (peak sharpness → measurement noise).
     """
     if heat.ndim == 3:
         heat2d = heat[0]
@@ -61,9 +64,13 @@ def detection_to_measurement(
     else:
         raise ValueError(f"expected (1,H,W) or (H,W), got {tuple(heat.shape)}")
 
-    peak = float(heat2d.max().item())
-    if peak < peak_thresh:
-        return None, None
+    if presence is not None:
+        if isinstance(presence, torch.Tensor):
+            p = float(torch.sigmoid(presence.reshape(-1)[0]).item())
+        else:
+            p = float(1.0 / (1.0 + np.exp(-float(presence))))
+        if p < presence_thresh:
+            return None, None
 
     flat = heat2d.reshape(-1)
     idx = int(flat.argmax().item())
@@ -73,13 +80,8 @@ def detection_to_measurement(
     x0, y0 = float(origin[0]), float(origin[1])
     z = np.array([x_c + x0, y_c + y0], dtype=np.float64)
 
-    if log_sigma is None:
-        return z, None
-    if isinstance(log_sigma, torch.Tensor):
-        log_s = float(log_sigma.reshape(-1)[0].item())
-    else:
-        log_s = float(log_sigma)
-    sigma = float(np.exp(log_s))
+    heat_b = heat2d.detach().float().unsqueeze(0).unsqueeze(0)
+    sigma = float(soft_heatmap_spatial_std(heat_b, temperature=temperature)[0].item())
     sigma = max(sigma_min, min(sigma, sigma_max))
     return z, sigma
 
@@ -97,16 +99,11 @@ def run_track_detect_loop(
     img_h: int,
     buckets: Sequence[int] = (64, 128, 256),
     n_sigma: float = 3.0,
-    peak_thresh: float = 0.3,
+    presence_thresh: float = 0.5,
 ) -> list[TrackDetectResult]:
     """Predict → gate crop → detect → update for each frame after ``z0``.
 
-    ``frame_stacks[t]`` is the modality tensor ``(C, H, W)`` for the temporal
-    window ending at frame ``t`` (already at training resolution).
-    ``detect_fn(crop, x0, y0, size)`` returns ``(heatmap, log_sigma|None)``.
-
-    Frame 0 is initiated from ``z0`` without a detector call; subsequent frames
-    run the full loop. Length of results equals ``len(frame_stacks)``.
+    ``detect_fn(crop, x0, y0, size)`` returns ``(heatmap_logits, presence_logit)``.
     """
     if not frame_stacks:
         return []
@@ -139,14 +136,14 @@ def run_track_detect_loop(
         else:
             stack_t = stack
         crop = crop_chw_stack(stack_t, x0, y0, size)
-        heat, log_sigma = detect_fn(crop, x0, y0, size)
+        heat, presence = detect_fn(crop, x0, y0, size)
         z, r = detection_to_measurement(
             heat.detach().cpu() if isinstance(heat, torch.Tensor) else heat,
-            log_sigma.detach().cpu()
-            if isinstance(log_sigma, torch.Tensor)
-            else log_sigma,
+            presence.detach().cpu()
+            if isinstance(presence, torch.Tensor)
+            else presence,
             origin=(x0, y0),
-            peak_thresh=peak_thresh,
+            presence_thresh=presence_thresh,
         )
         state = tracker.update(state, z, r_meas=r)
         results.append(
@@ -173,21 +170,21 @@ def stub_detect_fn(
     [torch.Tensor, int, int, int],
     tuple[torch.Tensor, torch.Tensor | float | None],
 ]:
-    """Oracle stub detector for smoke tests (writes a delta peak at true xy)."""
+    """Oracle stub detector for smoke tests (delta peak + presence logit)."""
     rng = rng or np.random.default_rng(0)
     call_t = {"i": 0}
 
     def _detect(
         crop: torch.Tensor, x0: int, y0: int, size: int
-    ) -> tuple[torch.Tensor, float | None]:
-        # Advance index: caller runs detect starting at t=1.
+    ) -> tuple[torch.Tensor, float]:
         call_t["i"] += 1
         t = call_t["i"]
-        heat = torch.zeros(1, size, size, dtype=torch.float32)
+        # Logits: large positive at peak, zeros elsewhere.
+        heat = torch.full((1, size, size), -4.0, dtype=torch.float32)
         if t >= len(true_xy) or true_xy[t] is None:
-            return heat, None
+            return heat, -4.0  # low presence
         if miss_prob > 0 and float(rng.random()) < miss_prob:
-            return heat, float(np.log(max(noise_sigma, 0.5)))
+            return heat, -4.0
         xy = np.asarray(true_xy[t], dtype=np.float64).reshape(2)
         if noise_sigma > 0:
             xy = xy + rng.normal(0.0, noise_sigma, size=2)
@@ -196,8 +193,8 @@ def stub_detect_fn(
         ix = int(round(xc))
         iy = int(round(yc))
         if 0 <= ix < size and 0 <= iy < size:
-            heat[0, iy, ix] = 1.0
-            return heat, float(np.log(max(noise_sigma, 0.5)))
-        return heat, float(np.log(max(noise_sigma, 0.5)))
+            heat[0, iy, ix] = 8.0
+            return heat, 4.0  # high presence
+        return heat, -4.0
 
     return _detect

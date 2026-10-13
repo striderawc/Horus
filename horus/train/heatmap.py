@@ -17,12 +17,12 @@ from horus.models import (
     circle_bce_loss,
     circle_mse_loss,
     coord_distance_loss,
-    gaussian_nll_loss,
+    focal_presence_loss,
     unpack_model_output,
 )
 from horus.train.tb import log_heatmap_images, log_scalars
 
-LossKind = Literal["coord", "circle_mse", "circle_bce"]
+LossKind = Literal["focal_presence", "coord", "circle_mse", "circle_bce"]
 
 
 def _batch_loss(
@@ -32,27 +32,38 @@ def _batch_loss(
     *,
     height: int,
     width: int,
-    loss: LossKind = "coord",
+    loss: LossKind = "focal_presence",
     circle_radius: float = 3.0,
-    log_sigma: torch.Tensor | None = None,
-    nll_weight: float = 0.0,
+    presence_logit: torch.Tensor | None = None,
+    heatmap_target: torch.Tensor | None = None,
+    focal_alpha: float = 2.0,
+    focal_beta: float = 4.0,
+    presence_weight: float = 1.0,
 ) -> torch.Tensor:
-    if loss == "circle_mse":
-        base = circle_mse_loss(pred, coords, visible, radius=circle_radius)
-    elif loss == "circle_bce":
-        base = circle_bce_loss(pred, coords, visible, radius=circle_radius)
-    else:
-        # Positives: coord peak loss. Negatives: push heatmap toward empty
-        # (coord loss alone skips them and can yield a non-differentiable 0).
-        base = coord_distance_loss(pred, coords, visible, height=height, width=width)
-        neg = visible.reshape(-1) <= 0.5
-        if neg.any():
-            base = base + pred[neg].pow(2).mean()
-    if log_sigma is not None and nll_weight > 0:
-        nll = gaussian_nll_loss(
-            pred, coords, log_sigma, visible, height=height, width=width
+    if loss == "focal_presence":
+        if presence_logit is None or heatmap_target is None:
+            raise ValueError(
+                "focal_presence requires presence_logit and heatmap_target"
+            )
+        return focal_presence_loss(
+            pred,
+            presence_logit,
+            heatmap_target,
+            visible,
+            alpha=focal_alpha,
+            beta=focal_beta,
+            presence_weight=presence_weight,
         )
-        return base + float(nll_weight) * nll
+    if loss == "circle_mse":
+        return circle_mse_loss(pred, coords, visible, radius=circle_radius)
+    if loss == "circle_bce":
+        return circle_bce_loss(pred, coords, visible, radius=circle_radius)
+    # Ablation: coord peak loss; negatives push heatmap toward empty.
+    base = coord_distance_loss(pred, coords, visible, height=height, width=width)
+    neg = visible.reshape(-1) <= 0.5
+    if neg.any():
+        probs = torch.sigmoid(pred) if pred.min() < 0 else pred
+        base = base + probs[neg].pow(2).mean()
     return base
 
 
@@ -120,9 +131,12 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     *,
-    loss: LossKind = "coord",
+    loss: LossKind = "focal_presence",
     circle_radius: float = 3.0,
-    nll_weight: float = 0.0,
+    focal_alpha: float = 2.0,
+    focal_beta: float = 4.0,
+    presence_weight: float = 1.0,
+    presence_thresh: float = 0.5,
 ) -> EvalEpochStats:
     """Mean training loss plus visible-ball localization metrics."""
     model.eval()
@@ -133,8 +147,9 @@ def evaluate(
         x = batch["input"].to(device)
         coords = batch["coords"].to(device)
         visible = _visible_mask(batch).to(device)
+        heatmap_target = batch["heatmap"].to(device)
         _, _, h, w = x.shape
-        heat, log_sigma = unpack_model_output(model(x))
+        heat, presence = unpack_model_output(model(x))
         total_loss += _batch_loss(
             heat,
             coords,
@@ -143,12 +158,21 @@ def evaluate(
             width=w,
             loss=loss,
             circle_radius=circle_radius,
-            log_sigma=log_sigma,
-            nll_weight=nll_weight,
+            presence_logit=presence,
+            heatmap_target=heatmap_target,
+            focal_alpha=focal_alpha,
+            focal_beta=focal_beta,
+            presence_weight=presence_weight,
         ).item()
         n_batches += 1
+        # Acc only on frames the model accepts as present (and GT present).
+        if presence is not None:
+            accept = torch.sigmoid(presence).reshape(-1) >= presence_thresh
+            eval_vis = visible.reshape(-1) * accept.float()
+        else:
+            eval_vis = visible
         dists = visible_pixel_distances(
-            heat, coords, visible, height=h, width=w
+            heat, coords, eval_vis, height=h, width=w
         )
         if dists.numel():
             dist_sum += float(dists.sum().item())
@@ -179,9 +203,11 @@ def train_one_epoch(
     writer: SummaryWriter | None = None,
     global_step: int = 0,
     log_every: int = 50,
-    loss: LossKind = "coord",
+    loss: LossKind = "focal_presence",
     circle_radius: float = 3.0,
-    nll_weight: float = 0.0,
+    focal_alpha: float = 2.0,
+    focal_beta: float = 4.0,
+    presence_weight: float = 1.0,
 ) -> tuple[TrainEpochStats, int]:
     """One pass over ``loader``. Returns epoch stats and updated ``global_step``."""
     model.train()
@@ -192,9 +218,10 @@ def train_one_epoch(
         x = batch["input"].to(device)
         coords = batch["coords"].to(device)
         visible = _visible_mask(batch).to(device)
+        heatmap_target = batch["heatmap"].to(device)
         _, _, h, w = x.shape
         opt.zero_grad(set_to_none=True)
-        heat, log_sigma = unpack_model_output(model(x))
+        heat, presence = unpack_model_output(model(x))
         batch_loss = _batch_loss(
             heat,
             coords,
@@ -203,8 +230,11 @@ def train_one_epoch(
             width=w,
             loss=loss,
             circle_radius=circle_radius,
-            log_sigma=log_sigma,
-            nll_weight=nll_weight,
+            presence_logit=presence,
+            heatmap_target=heatmap_target,
+            focal_alpha=focal_alpha,
+            focal_beta=focal_beta,
+            presence_weight=presence_weight,
         )
         batch_loss.backward()
         layers = layer_grad_norms(model)
@@ -276,18 +306,13 @@ def log_loader_heatmaps(
     tag: str = "debug/heatmap_gt_pred_abserr",
     circle_radius: float | None = None,
 ) -> None:
-    """Log GT | pred heatmap strips, or pred/GT coord scalars for coord heads.
-
-    When ``circle_radius`` is set, GT is a binary disk built from ``coords``
-    (SNN circle-BCE path) instead of the dataset Gaussian heatmap.
-    """
+    """Log GT | pred heatmap strips (sigmoid of logits)."""
     model.eval()
     batch = next(iter(loader))
     x = batch["input"].to(device)
     pred, _ = unpack_model_output(model(x))
-    pred = pred.cpu()
+    pred = torch.sigmoid(pred).cpu()
     if pred.ndim == 2 and pred.shape[-1] == 2:
-        # Direct (x, y) head — log normalized coords instead of heatmaps.
         coords = batch["coords"]
         _, _, h, w = batch["input"].shape
         scale = torch.tensor([float(w - 1), float(h - 1)])

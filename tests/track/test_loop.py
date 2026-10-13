@@ -57,6 +57,7 @@ def test_closed_loop_stub_runs():
         img_w=640,
         img_h=360,
         buckets=[64, 128, 256],
+        presence_thresh=0.5,
     )
     assert len(results) == n
     assert results[0].detected
