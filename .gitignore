@@ -1,5 +1,5 @@
 # Local dataset (large image files — do not commit)
-/Dataset/
+/data/Dataset/
 
 # Processed modalities (events, caches)
 /data/processed/
@@ -7,6 +7,7 @@
 
 # Training checkpoints
 /checkpoints/
+**/saved_models/
 
 # TensorBoard runs
 /runs/

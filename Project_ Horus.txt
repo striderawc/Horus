@@ -1,7 +1,0 @@
-﻿Project: Horus
-
-
-Plan: Build my own version of a tennis ball tracker, but with the aim in mind of eventually being able to run using an event stream from an event based camera. Data will be represented in different ways to test different things out: 1) RGB video / frames (normal/baseline), 2) Frame differencing, and 3) V2E events (final goal). Models will accept a sequence of this data and will be tasked with predicting where in the image the ball is. This will create a track of its position across time. This track will then be used, along with a calculated geometry of the court from 2D to 3D, to produce the following metrics: 1) Ball bounce position, 2) Ball Speed. The models themselves will also vary in architecture - the initial model will be a CNN, then an SNN. Model performance will be judged on accuracy and efficiency as the goal here is to model neuromorphic AI and be efficient. 
-Overall timeline: 1) Learn, 2) Collect dataset (RGB, frame differencing, and V2E), 3) Train models RGB CNN (Baseline), Differencing CNN, V2E SNN 4) Build metrics from successful tracks 5) Build app
-Future Directions:
-SSM - where on the image processing is needed - possibly reverting back to RGB or DL if ball cannot be found - or just waiting for motion

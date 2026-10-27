@@ -1,3 +1,8 @@
+# Install from pyproject.toml instead:
+#   pip install -e .
+#   pip install -e ".[dev,eval]"
+#
+# Core runtime deps (kept in sync with [project] dependencies):
 numpy>=1.24
 opencv-python-headless>=4.8
 Pillow>=10.0

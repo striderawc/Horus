@@ -1,0 +1,30 @@
+paths:
+  dataset: data/Dataset
+
+model:
+  num_frames: 6
+  channels_per_frame: 3
+
+# Source frames are 1280×720; training res below
+image:
+  width: 640
+  height: 360
+
+heatmap:
+  sigma: 2.5
+  amplitude: 1.0
+
+splits:
+  train: [game1, game2, game3, game4, game5, game6, game7]
+  val: [game8, game9]
+  test: [game10]
+
+train:
+  name: baseline_cnn_train3_focal
+  epochs: 20
+  batch_size: 4
+  lr: 0.001
+  num_workers: 2
+  # focal loss hyperparameters
+  focal_alpha: 2.0
+  focal_beta: 4.0
