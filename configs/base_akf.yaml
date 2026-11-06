@@ -1,0 +1,24 @@
+paths:
+  dataset: data/Dataset
+
+splits:
+  train: [game1, game2, game3, game4, game5, game6, game7]
+  val: [game8, game9]
+  test: [game10]
+
+# State is [x, y, vx, vy] in source pixels and pixels per frame.
+tracker:
+  q_pos: 4.0
+  q_vel: 16.0
+  r_meas: 8.0
+  init_pos_std: 12.0
+  init_vel_std: 60.0
+  # Decay of process-noise scale when the residual is quiet.
+  forgetting: 0.85
+  q_max_scale: 25.0
+  # On update(None): grow scale, damp velocity, add position variance.
+  miss_growth: 1.5
+  miss_vel_decay: 0.0
+  miss_pos_std: 25.0
+  # Uncertainty frame used by track.py (± nσ on predicted position).
+  gate_sigma: 3.0

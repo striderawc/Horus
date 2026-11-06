@@ -1,0 +1,35 @@
+paths:
+  dataset: data/Dataset
+
+model:
+  num_diffs: 2
+
+# Crops are cut from the 1280×720 source frames. Sides are snapped to `multiple`.
+crop:
+  min_side: 48
+  max_side: 720
+  multiple: 4
+  # Among labeled balls (visibility > 0): usually centered, sometimes offset, sometimes outside.
+  p_centered: 0.65
+  p_offset: 0.20
+  p_absent: 0.15
+  center_jitter: 0.12
+
+# Sigma is in source pixels (baseline uses 2.5 at half resolution).
+heatmap:
+  sigma: 5.0
+  amplitude: 1.0
+
+splits:
+  train: [game1, game2, game3, game4, game5, game6, game7]
+  val: [game8, game9]
+  test: [game10]
+
+train:
+  name: cnn_detector
+  epochs: 40
+  batch_size: 16
+  lr: 0.001
+  num_workers: 2
+  focal_alpha: 2.0
+  focal_beta: 4.0

@@ -20,7 +20,7 @@ splits:
   test: [game10]
 
 train:
-  name: baseline_cnn_train3_focal
+  name: baseline_cnn_train4_focal
   epochs: 20
   batch_size: 4
   lr: 0.001
