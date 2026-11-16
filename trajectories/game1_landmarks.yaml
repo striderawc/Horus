@@ -1,0 +1,67 @@
+# Pixels for one game-1 frame. Leave image null until you mark the point.
+# frame is a path under the dataset, for example game1/Clip1/0100.jpg.
+# World coordinates are meters. Origin is the court center on the ground.
+# +X is horizontal, to the right, the same direction as pixel x.
+# +Y is vertical, downward, the same direction as pixel y. The near baseline
+# is the one toward the bottom of the frame. +Z is up.
+# left / right are the sidelines. near / far are the baselines and service lines.
+# Mark 8 to 14 of these. Four ground points are the minimum that will run.
+
+frame: game1/Clip1/0001.jpg
+image_size: [1280, 720]
+
+landmarks:
+  doubles_near_left:
+    world: [-5.485, 11.885, 0.0]
+    image: [190, 535]
+  doubles_near_right:
+    world: [5.485, 11.885, 0.0]
+    image: [1090, 530]
+  doubles_far_left:
+    world: [-5.485, -11.885, 0.0]
+    image: [420, 165]
+  doubles_far_right:
+    world: [5.485, -11.885, 0.0]
+    image: [865, 165]
+  singles_near_left:
+    world: [-4.115, 11.885, 0.0]
+    image: [305, 535]
+  singles_near_right:
+    world: [4.115, 11.885, 0.0]
+    image: [975, 530]
+  singles_far_left:
+    world: [-4.115, -11.885, 0.0]
+    image: [475, 165]
+  singles_far_right:
+    world: [4.115, -11.885, 0.0]
+    image: [810, 165]
+  service_near_left:
+    world: [-4.115, 6.4, 0.0]
+    image: [370, 395]
+  service_near_right:
+    world: [4.115, 6.4, 0.0]
+    image: [910, 395]
+  service_far_left:
+    world: [-4.115, -6.4, 0.0]
+    image: [455, 215]
+  service_far_right:
+    world: [4.115, -6.4, 0.0]
+    image: [830, 215]
+  baseline_near:
+    world: [0.0, 11.885, 0.0]
+    image: [640, 530]
+  baseline_far:
+    world: [0.0, -11.885, 0.0]
+    image: [642, 165]
+  service_near:
+    world: [0.0, 6.4, 0.0]
+    image: [640, 395]
+  service_far:
+    world: [0.0, -6.4, 0.0]
+    image: [642, 215]
+  net_post_left:
+    world: [-6.399, 0.0, 1.07]
+    image: [290, 230]
+  net_post_right:
+    world: [6.399, 0.0, 1.07]
+    image: [990, 230]

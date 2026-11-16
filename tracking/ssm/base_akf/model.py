@@ -6,7 +6,8 @@ import numpy as np
 
 # 95% threshold for a 2-D Gaussian innovation.
 _CHI2 = 5.991
-_F = np.array(
+# One frame of constant velocity. State is [x, y, vx, vy].
+F = np.array(
     [
         [1.0, 0.0, 1.0, 0.0],
         [0.0, 1.0, 0.0, 1.0],
@@ -21,7 +22,7 @@ class SSM:
 
     AKF with the usual SSM loop: ``initiate`` → ``predict`` → ``update``.
     ``update`` adapts process-noise scale from the innovation; ``update(None)``
-    damps velocity and grows uncertainty so a later gate can reopen.
+    keeps velocity and grows uncertainty so a later gate can reopen.
     ``r_std`` overrides ``r_meas`` for that frame (pixels); omit it to keep the config value.
     """
 
@@ -34,7 +35,7 @@ class SSM:
         self.forget = float(cfg["forgetting"])
         self.q_max = float(cfg["q_max_scale"])
         self.miss_growth = float(cfg.get("miss_growth", 1.5))
-        self.miss_vel_decay = float(cfg.get("miss_vel_decay", 0.0))
+        self.miss_vel_decay = float(cfg.get("miss_vel_decay", 1.0))
         self.miss_pos_bump = float(cfg.get("miss_pos_std", 25.0)) ** 2
         self.x: np.ndarray | None = None
         self.P: np.ndarray | None = None
@@ -57,8 +58,8 @@ class SSM:
     def predict(self) -> None:
         qv = self.q_vel * self.scale
         q = np.diag([self.q_pos, self.q_pos, qv, qv])
-        self.x = _F @ self.x
-        self.P = _F @ self.P @ _F.T + q
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + q
         self.P = 0.5 * (self.P + self.P.T)
 
     def update(self, y, r_std: float | None = None):
@@ -89,3 +90,63 @@ class SSM:
         self.x = self.x + gain @ innov
         self.P = self.P - gain @ self.P[:2, :]
         self.P = 0.5 * (self.P + self.P.T)
+
+
+def rts_smooth(
+    state: np.ndarray,
+    cov: np.ndarray,
+    pred_state: np.ndarray,
+    pred_cov: np.ndarray,
+) -> np.ndarray:
+    """Rauch–Tung–Striebel means for a finished clip.
+
+    ``state[k]`` and ``cov[k]`` are the filtered Gaussian. ``pred_state[k]``
+    and ``pred_cov[k]`` are the prediction of frame ``k`` made from frame
+    ``k - 1``; the first frame of a run has no prediction. Frames with no
+    filtered state stay nan. Returns ``(N, 4)``.
+    """
+    state = np.asarray(state, dtype=np.float64)
+    cov = np.asarray(cov, dtype=np.float64)
+    pred_state = np.asarray(pred_state, dtype=np.float64)
+    pred_cov = np.asarray(pred_cov, dtype=np.float64)
+    n = len(state)
+    out = np.full((n, state.shape[1]), np.nan, dtype=np.float64)
+    finite = np.isfinite(state).all(axis=1)
+    predicted = np.isfinite(pred_state).all(axis=1)
+    start = 0
+    while start < n:
+        if not finite[start]:
+            start += 1
+            continue
+        end = start
+        while end + 1 < n and finite[end + 1] and predicted[end + 1]:
+            end += 1
+        out[start : end + 1] = _rts_run(
+            state[start : end + 1],
+            cov[start : end + 1],
+            pred_state[start : end + 1],
+            pred_cov[start : end + 1],
+        )
+        start = end + 1
+    return out
+
+
+def _rts_run(
+    state: np.ndarray,
+    cov: np.ndarray,
+    pred_state: np.ndarray,
+    pred_cov: np.ndarray,
+) -> np.ndarray:
+    mean = state.copy()
+    cov = cov.copy()
+    n = len(mean)
+    for k in range(n - 2, -1, -1):
+        filtered = cov[k].copy()
+        predicted = pred_cov[k + 1]
+        gain = np.linalg.solve(predicted, (filtered @ F.T).T).T
+        mean[k] = mean[k] + gain @ (mean[k + 1] - pred_state[k + 1])
+        updated = filtered + gain @ (cov[k + 1] - predicted) @ gain.T
+        updated = 0.5 * (updated + updated.T)
+        vals, vecs = np.linalg.eigh(updated)
+        cov[k] = (vecs * np.maximum(vals, 0.0)) @ vecs.T
+    return mean
