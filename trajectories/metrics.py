@@ -1,8 +1,9 @@
-"""Shot metrics from one gravity-only flight.
+"""Shot metrics from one fitted flight.
 
-``measure_shot`` reads ``theta`` from ``fit_flight``. Speed is the launch
-speed. Clearance is the ball's height above the tape where the flight crosses
-the net, before it returns to the ground.
+``measure_shot`` reads ``theta`` from the fit. Pass ``fit.rules`` so the
+heights and the landing are the flight that was fit. Speed is the launch
+speed. Clearance is the ball's height above the tape where the flight
+crosses the net, before it returns to the ground.
 """
 
 from __future__ import annotations
@@ -48,14 +49,17 @@ class ShotMetrics:
     t_landing: float
 
 
-def measure_shot(theta: np.ndarray) -> ShotMetrics:
+def measure_shot(theta: np.ndarray, model=None) -> ShotMetrics:
     """Speed, height, net clearance, and landing for one fitted flight.
 
     ``theta`` is ``[X0, Y0, Z0, vx0, vy0, vz0]`` at the contact, in court
-    meters and meters per second. The ground intersection is the later root
-    of ``Z(t) = 0``.
+    meters and meters per second. ``model`` is the fit's ``FlightRules``, or
+    an acceleration callable. Omit it for the closed-form gravity flight.
     """
     theta = np.asarray(theta, dtype=np.float64).reshape(6)
+    acceleration = model.acceleration() if hasattr(model, "acceleration") else model
+    if acceleration is not None:
+        return _measure_integrated(theta, acceleration)
     x0, y0, z0, vx, vy, vz = (float(v) for v in theta)
     speed = float(np.linalg.norm(theta[3:]))
     horizontal = float(np.hypot(vx, vy))
@@ -98,6 +102,87 @@ def measure_shot(theta: np.ndarray) -> ShotMetrics:
         t_apex=float(t_apex),
         t_net=t_net,
         t_landing=float(t_landing),
+    )
+
+
+def _measure_integrated(theta: np.ndarray, acceleration) -> ShotMetrics:
+    """Landing, apex, and net clearance from the integrated flight."""
+    y0, z0 = float(theta[1]), float(theta[2])
+    vx, vy, vz = (float(v) for v in theta[3:])
+    speed = float(np.linalg.norm(theta[3:]))
+    horizontal = float(np.hypot(vx, vy))
+    horizon = 5.0
+    times = np.linspace(0.0, horizon, int(horizon / 0.01) + 1)
+    pos, _ = simulate(theta, times, acceleration)
+    z = pos[:, 2]
+    crossing = None
+    for i in range(1, len(times)):
+        if z[i - 1] > 0.0 and z[i] <= 0.0:
+            crossing = i
+            break
+    if crossing is None:
+        t_landing = float(times[-1])
+        landing_xyz = pos[-1].copy()
+    else:
+        z_before, z_after = float(z[crossing - 1]), float(z[crossing])
+        span = z_before - z_after
+        frac = 0.0 if abs(span) < 1e-9 else float(np.clip(z_before / span, 0.0, 1.0))
+        t_landing = float(times[crossing - 1] + frac * (times[crossing] - times[crossing - 1]))
+        landing_xyz = pos[crossing - 1] + frac * (pos[crossing] - pos[crossing - 1])
+        landing_xyz = landing_xyz.copy()
+        landing_xyz[2] = 0.0
+    before = times <= t_landing + 1e-9
+    apex_i = int(np.argmax(z[before]))
+    t_apex = float(times[before][apex_i])
+    apex = pos[np.flatnonzero(before)[apex_i]].copy()
+    net_xyz = None
+    net_ball = None
+    clearance = None
+    wide = False
+    t_net = None
+    y = pos[:, 1]
+    for i in range(1, len(times)):
+        if times[i] >= t_landing - 1e-6:
+            break
+        if y[i - 1] * y[i] >= 0.0:
+            continue
+        span = float(y[i - 1] - y[i])
+        if abs(span) < 1e-8:
+            continue
+        frac = float(np.clip(y[i - 1] / span, 0.0, 1.0))
+        t_net = float(times[i - 1] + frac * (times[i] - times[i - 1]))
+        if t_net <= 1e-6:
+            t_net = None
+            continue
+        net_xyz = pos[i - 1] + frac * (pos[i] - pos[i - 1])
+        net_xyz = net_xyz.copy()
+        net_ball = float(net_xyz[2])
+        tape = net_height(float(net_xyz[0]))
+        if np.isfinite(tape):
+            clearance = net_ball - tape
+        else:
+            wide = True
+        break
+    side = 1.0 if y0 >= 0.0 else -1.0
+    past_net = -side * float(landing_xyz[1])
+    return ShotMetrics(
+        speed_mps=speed,
+        speed_mph=speed * MPS_TO_MPH,
+        contact_height_m=z0,
+        apex_height_m=float(apex[2]),
+        apex_xyz=apex,
+        net_ball_height_m=net_ball,
+        net_clearance_m=clearance,
+        net_wide=wide,
+        net_xyz=net_xyz,
+        launch_angle_deg=float(np.degrees(np.arctan2(vz, horizontal))),
+        landing_xyz=landing_xyz,
+        past_net_m=past_net,
+        baseline_margin_m=HALF_LENGTH - past_net,
+        landing=_landing_label(side, float(landing_xyz[0]), float(landing_xyz[1])),
+        t_apex=t_apex,
+        t_net=t_net,
+        t_landing=t_landing,
     )
 
 

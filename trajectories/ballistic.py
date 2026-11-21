@@ -1,34 +1,28 @@
 """Six-parameter ballistic fit in court coordinates.
 
-For one uninterrupted flight, time in seconds from the first sample:
+``theta = [X0, Y0, Z0, vx0, vy0, vz0]`` at the contact. ``FlightRules`` is
+the model: drag, whether the bounce is on the ground, contact height, and
+how the ball leaves a bounce. ``fit_shots`` stores those rules on the fit.
+Playing the fit back uses that stored model, so the printed path is the one
+that was fit.
+
+``drag_k = 0`` is the closed-form parabola
 
     X(t) = X0 + vx0 t
     Y(t) = Y0 + vy0 t
     Z(t) = Z0 + vz0 t - 0.5 g t^2
 
-``theta = [X0, Y0, Z0, vx0, vy0, vz0]``. The residual is in image pixels
-after projection through the camera. ``fit_shot`` pins the bounce to the
-ground and keeps the contact height in a playable range. The contact is fit
-from that shot's own pixels. An airborne contact starts on the camera ray
-through the first measurement, not at the ground intersection of that ray.
-When the flight from the bounce to the next hit is passed in, it leaves the
-bounce with the vertical velocity reversed. Horizontal velocity keeps its
-direction through the bounce and does not speed up. It can slow, so the
-continuation stays on the frames that were tracked. That continuation does
-not move the contact. ``fit_shots`` starts the next shot at the hit.
-A hit may change the horizontal velocity. ``fit_rally`` adds bounce
-constraints across several flights.
-``quadratic_drag`` is available and stays off unless a caller passes it
-as ``acceleration``.
+A positive ``drag_k`` integrates gravity plus ``-k |v| v`` on every
+component. The residual is image pixels after projection through the camera.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, root_scalar
 
 from trajectories.camera import Camera
 from trajectories.court import net_height
@@ -46,8 +40,6 @@ START_HEIGHT = 1.0
 # A shot leaves the racquet in this height range. Six meters is not a contact.
 CONTACT_Z_MIN = 0.2
 CONTACT_Z_MAX = 3.0
-# Vertical speed after the bounce, as a fraction of the speed coming in.
-RESTITUTION = 0.75
 # Least horizontal speed kept through a bounce, as a fraction of the speed
 # that arrived. The ball does not speed up and it does not turn. It can slow
 # by more than a tenth: a hard serve still going at 90% is past the baseline
@@ -55,6 +47,13 @@ RESTITUTION = 0.75
 BOUNCE_KEEP = 0.05
 # Heights tried when placing an airborne contact on the camera ray.
 _RAY_HEIGHTS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+# Pixels charged per meter of a landing or contact-height miss. Large enough
+# that the flight stays on the court before it chases the image.
+HEIGHT_PX = 5000.0
+# Pixels charged per unit of horizontal speed kept outside the bounce band.
+# A keep 0.3 outside the band costs 600 px, so it moves unless the image
+# residual is larger than that.
+BOUNCE_BAND_PX = 2000.0
 
 
 @dataclass
@@ -72,6 +71,24 @@ class FlightFit:
     follow_rmse_px: float | None = None
     hit_xyz: np.ndarray | None = None
     hit_velocity: np.ndarray | None = None
+    rules: FlightRules | None = None
+
+    def integrate(self, t, *, follow: bool = False):
+        """Position and velocity of the model that was fit.
+
+        ``follow`` is the flight that leaves the bounce. The acceleration is
+        the one stored on this fit.
+        """
+        theta = self.follow_theta if follow else self.theta
+        if theta is None:
+            raise ValueError("this fit has no bounce-to-hit flight")
+        acceleration = None if self.rules is None else self.rules.acceleration()
+        return simulate(theta, np.asarray(t, dtype=np.float64), acceleration)
+
+    def path(self, t, *, follow: bool = False) -> np.ndarray:
+        """Court positions of the model that was fit."""
+        pos, _ = self.integrate(t, follow=follow)
+        return pos
 
 
 @dataclass
@@ -97,19 +114,86 @@ def gravity(pos: np.ndarray, vel: np.ndarray) -> np.ndarray:
 
 
 def quadratic_drag(pos: np.ndarray, vel: np.ndarray, k: float = 0.02) -> np.ndarray:
-    """Gravity plus quadratic drag. Pass this as ``acceleration`` to turn it on.
+    """Gravity plus quadratic drag on every velocity component.
 
-    ``k`` is in 1/m. The default is a tennis ball in still air and is not used
-    by ``fit_flight`` or ``fit_rally`` unless the caller passes this function.
+    ``k`` is in 1/m. The drag term is ``-k |v| v``. ``FlightRules.drag_k``
+    is the value a shot fit uses.
     """
     vel = np.asarray(vel, dtype=np.float64)
     speed = float(np.linalg.norm(vel))
     return gravity(pos, vel) - k * speed * vel
 
 
-def ballistic(theta: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Court positions for the gravity-only flight. ``t`` is seconds."""
-    pos, _ = simulate(theta, t, None)
+@dataclass(frozen=True)
+class FlightRules:
+    """The trajectory model. Change this, refit, and the printout follows.
+
+    ``drag_k`` is quadratic drag in 1/m. ``0`` is the closed-form gravity
+    flight. ``pin_bounce_z`` solves vertical speed so the ball is on the
+    ground at the bounce. Set both contact heights, or set both to ``None``
+    to leave contact height free. ``contact_z_max`` is the serve. Every later
+    hit is capped at ``hit_z_max``. ``clear_net`` makes a crossing between the
+    posts clear the tape. ``lock_bounce_heading`` keeps the horizontal
+    direction through the bounce. The speed scale may sit in
+    ``[bounce_keep, 1]``, and a scale outside ``[bounce_keep_low,
+    bounce_keep_high]`` is penalized. Set both band edges to ``None`` to
+    turn that penalty off.
+    """
+
+    drag_k: float = 0.02
+    pin_bounce_z: bool = True
+    contact_z_min: float | None = CONTACT_Z_MIN
+    contact_z_max: float | None = CONTACT_Z_MAX
+    hit_z_max: float | None = 2.0
+    clear_net: bool = True
+    stay_above_court: bool = True
+    lock_bounce_heading: bool = True
+    bounce_keep: float = BOUNCE_KEEP
+    bounce_keep_low: float | None = 0.40
+    bounce_keep_high: float | None = 0.60
+
+    def acceleration(self):
+        """``None`` is the closed-form parabola. Otherwise gravity plus drag."""
+        if self.drag_k <= 0.0:
+            return None
+        k = float(self.drag_k)
+        return lambda pos, vel, k=k: quadratic_drag(pos, vel, k=k)
+
+    def contact_window(self) -> tuple[float, float] | None:
+        """Contact height limits, or ``None`` when height is free."""
+        if self.contact_z_min is None and self.contact_z_max is None:
+            return None
+        if self.contact_z_min is None or self.contact_z_max is None:
+            raise ValueError("set both contact heights, or set both to None")
+        zmin, zmax = float(self.contact_z_min), float(self.contact_z_max)
+        if zmin < 0.0 or zmax <= zmin:
+            raise ValueError("contact height bounds must satisfy 0 <= min < max")
+        return zmin, zmax
+
+    def validate(self) -> None:
+        if self.drag_k < 0.0:
+            raise ValueError("drag_k must be >= 0")
+        if not 0.0 <= self.bounce_keep <= 1.0:
+            raise ValueError("bounce_keep must be between 0 and 1")
+        self.contact_window()
+        _hit_limits(self)
+        low, high = self.bounce_keep_low, self.bounce_keep_high
+        if (low is None) != (high is None):
+            raise ValueError("set both bounce keep band edges, or set both to None")
+        if low is not None and not 0.0 <= float(low) <= float(high) <= 1.0:
+            raise ValueError("bounce keep band must satisfy 0 <= low <= high <= 1")
+
+
+DEFAULT_RULES = FlightRules()
+
+
+def ballistic(
+    theta: np.ndarray,
+    t: np.ndarray,
+    acceleration=None,
+) -> np.ndarray:
+    """Court positions. ``acceleration=None`` is the gravity parabola."""
+    pos, _ = simulate(theta, t, acceleration)
     return pos
 
 
@@ -194,37 +278,30 @@ def fit_shot(
     homography: np.ndarray,
     weights: np.ndarray | None = None,
     *,
-    contact_z_min: float = CONTACT_Z_MIN,
-    contact_z_max: float = CONTACT_Z_MAX,
-    acceleration=None,
+    rules: FlightRules | None = None,
     follow_uv: np.ndarray | None = None,
     follow_t: np.ndarray | None = None,
     follow_weights: np.ndarray | None = None,
     t_bounce: float | None = None,
-    restitution: float = RESTITUTION,
     origin: np.ndarray | None = None,
     t_hit: float | None = None,
+    bounce_xy: np.ndarray | None = None,
 ) -> FlightFit:
-    """Fit one shot that ends on the bounce.
+    """Fit one shot. ``rules`` is the model, and it is stored on the result.
 
-    ``Z(t_bounce) = 0`` fixes ``vz0``. ``t_bounce`` is seconds on the same
-    clock as ``t``; it defaults to the last sample. The contact height stays inside
-    ``contact_z_min`` and ``contact_z_max``. A flight that crosses the net
-    between the posts has to clear the tape.
-
-    ``follow_uv`` is the flight that leaves that bounce and runs to the next
-    hit. ``follow_t`` is seconds from the bounce. The shot is fit first, from
-    its own pixels. The continuation then starts at that bounce. Vertical
-    velocity reverses by ``restitution``. Horizontal velocity stays within a
-    small slowdown of the velocity that arrived, and it does not move the
-    contact. ``origin``, when set, is the previous hit: this shot starts there.
-    ``t_hit`` is seconds from the bounce to the next contact, and is stored
-    on the result as ``hit_xyz``.
+    ``t_bounce`` is seconds on the same clock as ``t``. It defaults to the
+    last sample. ``follow_uv`` is the flight that leaves the bounce and runs
+    to the next hit, with ``follow_t`` in seconds from the bounce. The shot
+    is fit from its own pixels. The continuation starts at that bounce and
+    does not move the contact. ``origin``, when set, is the previous hit.
+    ``t_hit`` is seconds from the bounce to the next contact.
+    ``bounce_xy`` is the court point of the bounce from the ground homography.
+    With ``pin_bounce_z`` it is fixed: the launch velocity is the one that
+    arrives there.
     """
-    if contact_z_min < 0.0 or contact_z_max <= contact_z_min:
-        raise ValueError("contact height bounds must satisfy 0 <= min < max")
-    if not 0.0 < restitution <= 1.0:
-        raise ValueError("restitution must be in (0, 1]")
+    rules = DEFAULT_RULES if rules is None else rules
+    rules.validate()
+    bounce_xy = _bounce_xy(bounce_xy, rules.pin_bounce_z)
     uv, t, weights = _finite(uv, t, weights)
     if len(uv) < 4:
         raise ValueError("fit needs at least 4 observations")
@@ -239,15 +316,7 @@ def fit_shot(
     point_w = _image_residual_weights(weights, len(uv))
     if origin is None:
         theta, solved = _fit_contact(
-            uv,
-            t,
-            t_end,
-            camera,
-            homography,
-            point_w,
-            contact_z_min,
-            contact_z_max,
-            acceleration,
+            uv, t, t_end, camera, homography, point_w, rules, bounce_xy
         )
     else:
         theta, solved = _fit_from_origin(
@@ -258,9 +327,10 @@ def fit_shot(
             camera,
             homography,
             point_w,
-            acceleration,
+            rules,
+            bounce_xy,
         )
-    pos, _ = simulate(theta, t, acceleration)
+    pos, _ = simulate(theta, t, rules.acceleration())
     pred = camera.project(pos)
     follow_theta, follow_xyz, follow_uv_hat, follow_rmse, hit = _fit_continuation(
         theta,
@@ -268,8 +338,7 @@ def fit_shot(
         follow,
         None if t_hit is None else float(t_hit),
         camera,
-        restitution,
-        acceleration,
+        rules,
     )
     return FlightFit(
         theta=theta,
@@ -285,6 +354,7 @@ def fit_shot(
         follow_rmse_px=follow_rmse,
         hit_xyz=None if hit is None else hit[0].copy(),
         hit_velocity=None if hit is None else hit[1].copy(),
+        rules=rules,
     )
 
 
@@ -305,6 +375,7 @@ class ShotInput:
     follow_t: np.ndarray | None = None
     follow_weights: np.ndarray | None = None
     t_hit: float | None = None
+    bounce_xy: np.ndarray | None = None
 
 
 def fit_shots(
@@ -312,22 +383,15 @@ def fit_shots(
     camera: Camera,
     homography: np.ndarray,
     *,
-    contact_z_min: float = CONTACT_Z_MIN,
-    contact_z_max: float = CONTACT_Z_MAX,
-    restitution: float = RESTITUTION,
-    acceleration=None,
+    rules: FlightRules | None = None,
 ) -> list[FlightFit]:
-    """Fit each shot from its own pixels, then start the next shot at the hit.
+    """Fit each shot with ``rules``, then start the next shot at the hit.
 
-    A shot with ``t_hit`` ends at the next shot's contact. That position is
-    the next shot's start. The flight already fit is left as it is. The hit
-    may change horizontal velocity. Through the bounce, horizontal velocity
-    keeps the incoming direction and can slow only down to ``BOUNCE_KEEP``.
+    The same rules are stored on every fit. A shot with ``t_hit`` ends at the
+    next shot's contact, and that position is the next shot's start.
     """
-    if contact_z_min < 0.0 or contact_z_max <= contact_z_min:
-        raise ValueError("contact height bounds must satisfy 0 <= min < max")
-    if not 0.0 < restitution <= 1.0:
-        raise ValueError("restitution must be in (0, 1]")
+    rules = DEFAULT_RULES if rules is None else rules
+    rules.validate()
     if not shots:
         return []
     prepared = [_prepare_shot(shot) for shot in shots]
@@ -336,12 +400,10 @@ def fit_shots(
     for shot in prepared:
         kwargs = {
             "t_bounce": shot.t_bounce,
-            "restitution": restitution,
-            "acceleration": acceleration,
-            "contact_z_min": contact_z_min,
-            "contact_z_max": contact_z_max,
+            "rules": rules if len(fitted) == 0 else _return_rules(rules),
             "origin": None if carried is None else carried.copy(),
             "t_hit": shot.t_hit,
+            "bounce_xy": shot.bounce_xy,
         }
         if shot.follow_uv is not None:
             kwargs.update(
@@ -382,104 +444,174 @@ def _prepare_shot(shot: ShotInput) -> ShotInput:
         follow_t=follow_t,
         follow_weights=follow_w,
         t_hit=t_hit,
+        bounce_xy=None if shot.bounce_xy is None else np.asarray(shot.bounce_xy, dtype=np.float64).reshape(2).copy(),
     )
 
 
-def _fit_contact(
-    uv, t, t_end, camera, homography, point_w, zmin, zmax, acceleration
-):
+def _fit_contact(uv, t, t_end, camera, homography, point_w, rules: FlightRules, bounce_xy):
     """Contact position and velocity from this shot's pixels."""
     theta0 = initial_theta(
-        uv, t, homography, bounce_end=True, bounce_start=False, camera=camera
+        uv,
+        t,
+        homography,
+        bounce_end=rules.pin_bounce_z,
+        bounce_start=False,
+        camera=camera,
     )
-    lower = np.array([-40.0, -40.0, zmin, -90.0, -90.0], dtype=np.float64)
-    upper = np.array([40.0, 40.0, zmax, 90.0, 90.0], dtype=np.float64)
-    packed0 = np.clip(theta0[:5], lower, upper)
+    window = rules.contact_window()
+    zmin, zmax = (0.0, 12.0) if window is None else window
+    acceleration = rules.acceleration()
+    if bounce_xy is not None:
+        lower = np.array([-40.0, -40.0, zmin], dtype=np.float64)
+        upper = np.array([40.0, 40.0, zmax], dtype=np.float64)
+        packed0 = np.clip(theta0[:3], lower, upper)
 
-    def residual(packed: np.ndarray) -> np.ndarray:
-        theta = _with_bounce(packed, t_end)
-        return np.concatenate(
-            [
-                _image_residual(theta, t, uv, camera, point_w, acceleration),
-                _clearance_residual(theta, t_end),
-            ]
+        def residual(packed: np.ndarray) -> np.ndarray:
+            theta = _launch_to_bounce(packed, t_end, bounce_xy, acceleration)
+            return _shot_residual(theta, t, t_end, uv, camera, point_w, rules)
+
+        solved = least_squares(
+            residual, packed0, bounds=(lower, upper), method="trf", max_nfev=80
         )
+        return _launch_to_bounce(solved.x, t_end, bounce_xy, acceleration), solved
+    if rules.pin_bounce_z:
+        lower = np.array([-40.0, -40.0, zmin, -90.0, -90.0], dtype=np.float64)
+        upper = np.array([40.0, 40.0, zmax, 90.0, 90.0], dtype=np.float64)
+        packed0 = np.clip(theta0[:5], lower, upper)
+
+        def residual(packed: np.ndarray) -> np.ndarray:
+            theta = _with_bounce(packed, t_end, acceleration)
+            return _shot_residual(theta, t, t_end, uv, camera, point_w, rules)
+
+        solved = least_squares(
+            residual, packed0, bounds=(lower, upper), method="trf", max_nfev=300
+        )
+        return _with_bounce(solved.x, t_end, acceleration), solved
+    lower = np.array([-40.0, -40.0, zmin, -90.0, -90.0, -90.0], dtype=np.float64)
+    upper = np.array([40.0, 40.0, zmax, 90.0, 90.0, 90.0], dtype=np.float64)
+    packed0 = np.clip(theta0, lower, upper)
+
+    def residual(theta: np.ndarray) -> np.ndarray:
+        return _shot_residual(theta, t, t_end, uv, camera, point_w, rules)
 
     solved = least_squares(
         residual, packed0, bounds=(lower, upper), method="trf", max_nfev=300
     )
-    return _with_bounce(solved.x, t_end), solved
+    return solved.x.copy(), solved
 
 
-def _fit_from_origin(origin, uv, t, t_end, camera, homography, point_w, acceleration):
+def _fit_from_origin(
+    origin, uv, t, t_end, camera, homography, point_w, rules: FlightRules, bounce_xy
+):
     """Velocity only. The shot starts at ``origin``, the previous hit."""
+    acceleration = rules.acceleration()
+    if bounce_xy is not None:
+        theta = _launch_to_bounce(origin, t_end, bounce_xy, acceleration)
+        return theta, _direct_solve()
     end = _ground(uv[-1], homography)
     duration = max(float(t_end), 1e-3)
-    guess = np.array(
+    horizontal = np.array(
         [(end[0] - origin[0]) / duration, (end[1] - origin[1]) / duration],
         dtype=np.float64,
     )
-    lower = np.array([-90.0, -90.0], dtype=np.float64)
-    upper = np.array([90.0, 90.0], dtype=np.float64)
-    guess = np.clip(guess, lower, upper)
+    if rules.pin_bounce_z:
+        lower = np.array([-90.0, -90.0], dtype=np.float64)
+        upper = np.array([90.0, 90.0], dtype=np.float64)
+        guess = np.clip(horizontal, lower, upper)
+
+        def residual(vel: np.ndarray) -> np.ndarray:
+            theta = _with_bounce(np.concatenate([origin, vel]), t_end, acceleration)
+            return _shot_residual(theta, t, t_end, uv, camera, point_w, rules)
+
+        solved = least_squares(
+            residual, guess, bounds=(lower, upper), method="trf", max_nfev=200
+        )
+        return _with_bounce(np.concatenate([origin, solved.x]), t_end, acceleration), solved
+    lower = np.array([-90.0, -90.0, -90.0], dtype=np.float64)
+    upper = np.array([90.0, 90.0, 90.0], dtype=np.float64)
+    vz = -float(origin[2]) / duration + 0.5 * G * duration
+    guess = np.clip(np.array([horizontal[0], horizontal[1], vz]), lower, upper)
 
     def residual(vel: np.ndarray) -> np.ndarray:
-        theta = _with_bounce(np.concatenate([origin, vel]), t_end)
-        return np.concatenate(
-            [
-                _image_residual(theta, t, uv, camera, point_w, acceleration),
-                _clearance_residual(theta, t_end),
-            ]
-        )
+        theta = np.concatenate([origin, vel])
+        return _shot_residual(theta, t, t_end, uv, camera, point_w, rules)
 
     solved = least_squares(
         residual, guess, bounds=(lower, upper), method="trf", max_nfev=200
     )
-    return _with_bounce(np.concatenate([origin, solved.x]), t_end), solved
+    return np.concatenate([origin, solved.x]), solved
 
 
-def _fit_continuation(theta, t_end, follow, t_hit, camera, restitution, acceleration):
+def _fit_continuation(theta, t_end, follow, t_hit, camera, rules: FlightRules):
     """Bounce-to-hit flight. The shot's contact stays where it was fit."""
     if follow is None:
         return None, None, None, None, None
     follow_uv, follow_t, follow_w = follow
     point_w = _image_residual_weights(follow_w, len(follow_uv))
+    acceleration = rules.acceleration()
+    _, incoming = simulate(theta, np.array([t_end], dtype=np.float64), acceleration)
+    arrived_vx = float(incoming[0, 0])
+    arrived_vy = float(incoming[0, 1])
+    t_contact = float(follow_t[-1] if t_hit is None else t_hit)
+    window = _hit_limits(rules)
+    if acceleration is None and window is not None:
+        vz_lo, vz_hi = _bounce_vz_bounds(t_contact, window[0], window[1])
+        t_air = max(t_contact, float(follow_t[-1]))
+        if t_air > t_contact + 1e-6:
+            vz_lo = min(vz_hi, max(vz_lo, 0.5 * G * t_air))
+    else:
+        vz_lo, vz_hi = 0.0, 90.0
+    vz_guess = float(np.clip(abs(incoming[0, 2]), vz_lo, vz_hi))
+    if acceleration is not None and window is not None:
+        mid = 0.5 * (window[0] + window[1])
+        vz_guess = mid / max(t_contact, 1e-3) + 0.5 * G * t_contact
+        vz_guess = float(np.clip(vz_guess, vz_lo, vz_hi))
+    ground_times = _time_grid(max(t_contact, float(follow_t[-1])), follow_t)
 
-    def residual(factor: np.ndarray) -> np.ndarray:
-        launched = _bounce_launch(
+    def launch(packed: np.ndarray) -> np.ndarray:
+        if rules.lock_bounce_heading:
+            scale = float(packed[0])
+            vz = float(packed[1])
+            vx, vy = arrived_vx * scale, arrived_vy * scale
+        else:
+            vx, vy, vz = (float(v) for v in packed)
+        return _bounce_launch(
             theta,
             t_end,
-            restitution,
             acceleration,
-            vx=float(theta[3]) * float(factor[0]),
-            vy=float(theta[4]) * float(factor[0]),
-        )
-        return np.concatenate(
-            [
-                _image_residual(
-                    launched, follow_t, follow_uv, camera, point_w, acceleration
-                ),
-                _clearance_residual(launched, float(follow_t[-1])),
-                _above_ground(launched, follow_t, acceleration),
-            ]
+            vx=vx,
+            vy=vy,
+            vz=vz,
+            on_ground=rules.pin_bounce_z,
         )
 
-    solved = least_squares(
-        residual,
-        np.array([0.5]),
-        bounds=([BOUNCE_KEEP], [1.0]),
-        method="trf",
-        max_nfev=40,
-    )
-    keep = float(solved.x[0])
-    launched = _bounce_launch(
-        theta,
-        t_end,
-        restitution,
-        acceleration,
-        vx=float(theta[3]) * keep,
-        vy=float(theta[4]) * keep,
-    )
+    def residual(packed: np.ndarray) -> np.ndarray:
+        launched = launch(packed)
+        parts = [
+            _image_residual(
+                launched, follow_t, follow_uv, camera, point_w, acceleration
+            )
+        ]
+        if rules.clear_net:
+            parts.append(_clearance_residual(launched, t_contact, acceleration))
+        if rules.stay_above_court:
+            parts.append(_above_ground(launched, ground_times, acceleration, HEIGHT_PX))
+        if acceleration is not None and window is not None:
+            pos, _ = simulate(launched, np.array([t_contact]), acceleration)
+            parts.append(_height_window(float(pos[0, 2]), window[0], window[1]))
+        parts.append(
+            _bounce_band(float(launched[3]), float(launched[4]), arrived_vx, arrived_vy, rules)
+        )
+        return np.concatenate(parts)
+
+    if rules.lock_bounce_heading:
+        guess = np.array([0.5, vz_guess])
+        bounds = ([rules.bounce_keep, vz_lo], [1.0, vz_hi])
+    else:
+        guess = np.array([arrived_vx * 0.5, arrived_vy * 0.5, vz_guess])
+        bounds = ([-90.0, -90.0, vz_lo], [90.0, 90.0, vz_hi])
+    solved = least_squares(residual, guess, bounds=bounds, method="trf", max_nfev=80)
+    launched = launch(solved.x)
     follow_xyz, _ = simulate(launched, follow_t, acceleration)
     follow_uv_hat = camera.project(follow_xyz)
     follow_rmse = _rmse(follow_uv_hat, follow_uv)
@@ -490,36 +622,218 @@ def _fit_continuation(theta, t_end, follow, t_hit, camera, restitution, accelera
     return launched, follow_xyz, follow_uv_hat, follow_rmse, hit
 
 
-def _with_bounce(packed: np.ndarray, t_end: float) -> np.ndarray:
+def _hit_limits(rules: FlightRules) -> tuple[float, float] | None:
+    """Height of a hit after the serve. ``None`` when that cap is off and contact is free."""
+    if rules.hit_z_max is None:
+        return rules.contact_window()
+    zmin = 0.0 if rules.contact_z_min is None else float(rules.contact_z_min)
+    zmax = float(rules.hit_z_max)
+    if zmax <= zmin:
+        raise ValueError("hit_z_max must be above the contact minimum")
+    return zmin, zmax
+
+
+def _return_rules(rules: FlightRules) -> FlightRules:
+    """Same model, with the serve cap replaced by the later-hit cap."""
+    limits = _hit_limits(rules)
+    if limits is None:
+        return rules
+    return replace(rules, contact_z_min=limits[0], contact_z_max=limits[1])
+
+
+def _bounce_xy(bounce_xy, pin: bool) -> np.ndarray | None:
+    """Ground point of the bounce. Ignored unless the bounce is on the court."""
+    if bounce_xy is None or not pin:
+        return None
+    point = np.asarray(bounce_xy, dtype=np.float64).reshape(2)
+    if not np.isfinite(point).all():
+        return None
+    return point.copy()
+
+
+class _DirectSolve:
+    success = True
+    cost = 0.0
+    message = "bounce position fixed"
+
+
+def _direct_solve() -> _DirectSolve:
+    return _DirectSolve()
+
+
+def _launch_to_bounce(contact, t_end, bounce_xy, acceleration) -> np.ndarray:
+    """Launch velocity whose flight is at ``bounce_xy`` on the ground at ``t_end``.
+
+    With no drag the velocity is the parabola that joins the two points. With
+    drag, that parabola is the start of a small solve for the same landing.
+    """
+    x0, y0, z0 = (float(v) for v in np.asarray(contact, dtype=np.float64).reshape(3))
+    xb, yb = (float(v) for v in bounce_xy)
+    t_end = max(float(t_end), 1e-3)
+    vx = (xb - x0) / t_end
+    vy = (yb - y0) / t_end
+    vz = -z0 / t_end + 0.5 * G * t_end
+    if acceleration is None:
+        return np.array([x0, y0, z0, vx, vy, vz], dtype=np.float64)
+    guess = np.clip(np.array([vx, vy, vz], dtype=np.float64), -90.0, 90.0)
+    target = np.array([xb, yb, 0.0], dtype=np.float64)
+
+    def miss(vel: np.ndarray) -> np.ndarray:
+        state = np.array([x0, y0, z0, vel[0], vel[1], vel[2]], dtype=np.float64)
+        pos, _ = simulate(state, np.array([t_end]), acceleration)
+        return pos[0] - target
+
+    solved = least_squares(
+        miss,
+        guess,
+        bounds=([-90.0, -90.0, -90.0], [90.0, 90.0, 90.0]),
+        method="trf",
+        xtol=1e-8,
+        ftol=1e-8,
+        max_nfev=40,
+    )
+    return np.array([x0, y0, z0, *solved.x], dtype=np.float64)
+
+
+def _bounce_band(vx: float, vy: float, arrived_vx: float, arrived_vy: float, rules: FlightRules) -> np.ndarray:
+    """Zero while the kept horizontal speed is inside the band."""
+    if rules.bounce_keep_low is None or rules.bounce_keep_high is None:
+        return np.zeros(0, dtype=np.float64)
+    speed_in = float(np.hypot(arrived_vx, arrived_vy))
+    if speed_in < 1e-3:
+        return np.zeros(1, dtype=np.float64)
+    frac = float(np.hypot(vx, vy)) / speed_in
+    gap = max(0.0, float(rules.bounce_keep_low) - frac)
+    gap += max(0.0, frac - float(rules.bounce_keep_high))
+    return np.array([gap * BOUNCE_BAND_PX], dtype=np.float64)
+
+
+def _bounce_vz_bounds(t_contact: float, z_min: float, z_max: float) -> tuple[float, float]:
+    """Upward speeds that leave the hit inside ``[z_min, z_max]``.
+
+    The continuation starts on the ground. Under gravity,
+    ``Z(t) = vz t - 0.5 g t^2``, so a hit still above the court means the
+    whole flight from the bounce to that hit stays above the court.
+    """
+    t_contact = max(float(t_contact), 1e-3)
+    low = z_min / t_contact + 0.5 * G * t_contact
+    high = z_max / t_contact + 0.5 * G * t_contact
+    low = float(np.clip(low, 0.0, 90.0))
+    high = float(np.clip(high, low, 90.0))
+    return low, high
+
+
+def _shot_residual(theta, t, t_end, uv, camera, point_w, rules: FlightRules) -> np.ndarray:
+    """Pixels, plus whichever rules are turned on."""
+    acceleration = rules.acceleration()
+    parts = [_image_residual(theta, t, uv, camera, point_w, acceleration)]
+    if rules.clear_net:
+        parts.append(_clearance_residual(theta, t_end, acceleration))
+    if rules.stay_above_court and acceleration is not None:
+        parts.append(_above_ground(theta, _time_grid(t_end, t), acceleration, HEIGHT_PX))
+    if rules.pin_bounce_z and acceleration is not None:
+        landed, _ = simulate(theta, np.array([float(t_end)]), acceleration)
+        parts.append(np.array([float(landed[0, 2]) * HEIGHT_PX], dtype=np.float64))
+    return np.concatenate(parts)
+
+
+def _height_window(z: float, z_min: float, z_max: float) -> np.ndarray:
+    """Zero while ``z`` is inside the contact range."""
+    return np.array(
+        [
+            max(0.0, float(z_min) - z) * HEIGHT_PX,
+            max(0.0, z - float(z_max)) * HEIGHT_PX,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _time_grid(t_end: float, extra=None) -> np.ndarray:
+    """Times from 0 through ``t_end``, plus any sample times in that span."""
+    t_end = max(float(t_end), 1e-3)
+    step = 0.02
+    grid = np.linspace(0.0, t_end, max(2, int(np.ceil(t_end / step)) + 1))
+    if extra is None:
+        return grid
+    extra = np.asarray(extra, dtype=np.float64).ravel()
+    extra = extra[(extra >= -1e-9) & (extra <= t_end + 1e-9)]
+    if len(extra) == 0:
+        return grid
+    return np.unique(np.concatenate([grid, np.clip(extra, 0.0, t_end)]))
+
+
+def _with_bounce(packed: np.ndarray, t_end: float, acceleration=None) -> np.ndarray:
     """Five free values, with ``vz`` set so the ball is on the ground at ``t_end``."""
     x0, y0, z0, vx, vy = (float(v) for v in np.asarray(packed, dtype=np.float64).reshape(5))
-    vz = -z0 / t_end + 0.5 * G * t_end
+    if acceleration is None:
+        vz = -z0 / t_end + 0.5 * G * t_end
+    else:
+        vz = _vz_landing(x0, y0, z0, vx, vy, t_end, acceleration)
     return np.array([x0, y0, z0, vx, vy, vz], dtype=np.float64)
+
+
+def _vz_landing(x0, y0, z0, vx, vy, t_end, acceleration) -> float:
+    """Launch ``vz`` whose integrated flight meets the ground at ``t_end``.
+
+    Drag makes the ball land sooner than the gravity guess, so the root is
+    searched around that guess. Higher ``vz`` is still higher at ``t_end``.
+    """
+    t_end = max(float(t_end), 1e-3)
+    guess = float(np.clip(-z0 / t_end + 0.5 * G * t_end, -90.0, 90.0))
+
+    def height(vz: float) -> float:
+        state = np.array([x0, y0, z0, vx, vy, float(vz)], dtype=np.float64)
+        pos, _ = simulate(state, np.array([t_end]), acceleration)
+        return float(pos[0, 2])
+
+    h_guess = height(guess)
+    if abs(h_guess) < 1e-4:
+        return guess
+    lo, hi = guess, guess
+    h_lo, h_hi = h_guess, h_guess
+    step = 2.0
+    if h_guess < 0.0:
+        while h_hi <= 0.0 and hi < 90.0:
+            hi = min(90.0, hi + step)
+            h_hi = height(hi)
+            step *= 1.6
+    else:
+        while h_lo >= 0.0 and lo > -90.0:
+            lo = max(-90.0, lo - step)
+            h_lo = height(lo)
+            step *= 1.6
+    if h_lo * h_hi > 0.0:
+        return lo if abs(h_lo) <= abs(h_hi) else hi
+    if lo > hi:
+        lo, hi = hi, lo
+    root = root_scalar(height, bracket=(lo, hi), xtol=1e-3)
+    return float(root.root)
 
 
 def _bounce_launch(
     theta: np.ndarray,
     t_bounce: float,
-    restitution: float,
     acceleration=None,
     vx: float | None = None,
     vy: float | None = None,
+    vz: float = 0.0,
+    on_ground: bool = True,
 ) -> np.ndarray:
     """State at the bounce for the flight that continues to the next hit.
 
-    Position is the shot's position at ``t_bounce``. Vertical velocity is
-    reversed and scaled by ``restitution``. ``vx`` and ``vy`` override the
-    horizontal velocity; omitted, they stay equal to the incoming velocity.
+    Position is the shot's position at ``t_bounce``. ``on_ground`` puts that
+    position on the court. ``vx`` and ``vy`` override the horizontal velocity.
+    ``vz`` is the upward speed of the continuation.
     """
     pos, vel = simulate(theta, np.array([t_bounce], dtype=np.float64), acceleration)
     return np.array(
         [
             pos[0, 0],
             pos[0, 1],
-            0.0,
+            0.0 if on_ground else pos[0, 2],
             vel[0, 0] if vx is None else vx,
             vel[0, 1] if vy is None else vy,
-            -restitution * vel[0, 2],
+            vz,
         ],
         dtype=np.float64,
     )
@@ -541,15 +855,39 @@ def _follow_samples(uv, t, weights):
     return uv, t, weights
 
 
-def _above_ground(theta, t, acceleration) -> np.ndarray:
+def _above_ground(theta, t, acceleration, weight: float = CONSTRAINT_PX) -> np.ndarray:
     """Zero while the ball is on or above the court."""
     pos, _ = simulate(theta, t, acceleration)
-    below = np.maximum(0.0, -pos[:, 2] - 0.01)
-    return below * CONSTRAINT_PX
+    below = np.maximum(0.0, -pos[:, 2])
+    return below * weight
 
 
-def _clearance_residual(theta: np.ndarray, t_end: float) -> np.ndarray:
+def _clearance_residual(theta: np.ndarray, t_end: float, acceleration=None) -> np.ndarray:
     """Zero unless the ball crosses between the posts below the tape."""
+    if acceleration is None:
+        return _clearance_gravity(theta, t_end)
+    t_end = float(t_end)
+    if t_end <= 1e-4:
+        return np.zeros(1, dtype=np.float64)
+    pos, _ = simulate(theta, _time_grid(t_end), acceleration)
+    y = pos[:, 1]
+    short = 0.0
+    for i in range(len(pos) - 1):
+        if y[i] * y[i + 1] >= 0.0:
+            continue
+        span = float(y[i] - y[i + 1])
+        if abs(span) < 1e-8:
+            continue
+        frac = float(np.clip(y[i] / span, 0.0, 1.0))
+        point = pos[i] + frac * (pos[i + 1] - pos[i])
+        tape = net_height(float(point[0]))
+        if np.isfinite(tape):
+            short = max(short, tape + CLEARANCE_MARGIN - float(point[2]))
+    return np.array([short * CLEARANCE_PX], dtype=np.float64)
+
+
+def _clearance_gravity(theta: np.ndarray, t_end: float) -> np.ndarray:
+    """Net clearance for the closed-form flight, where ``vy`` is constant."""
     x0, y0, z0, vx, vy, vz = (float(v) for v in theta)
     y_end = y0 + vy * t_end
     short = 0.0
@@ -568,14 +906,13 @@ def fit_rally(
     camera: Camera,
     homography: np.ndarray,
     *,
-    restitution: float = 0.75,
     acceleration=None,
 ) -> RallyFit:
     """Fit one ``theta`` per flight.
 
     A segment with ``bounce_end`` shares its end position with the next
-    flight's start, forces both heights to 0, keeps horizontal velocity
-    continuous, and reflects vertical velocity by ``restitution``.
+    flight's start, forces both heights to 0, and keeps horizontal velocity
+    continuous. Vertical velocity is not tied across the bounce.
     """
     if not segments:
         raise ValueError("fit_rally needs at least one flight")
@@ -625,7 +962,6 @@ def fit_rally(
             extra.append(pos_b[2] * CONSTRAINT_PX)
             extra.append((vel_b[0] - vel_a[0]) * CONSTRAINT_PX)
             extra.append((vel_b[1] - vel_a[1]) * CONSTRAINT_PX)
-            extra.append((vel_b[2] + restitution * vel_a[2]) * CONSTRAINT_PX)
         if extra:
             chunks.append(np.asarray(extra, dtype=np.float64))
         return np.concatenate(chunks)
